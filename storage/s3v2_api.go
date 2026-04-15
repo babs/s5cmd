@@ -37,6 +37,10 @@ type S3v2 struct {
 	requestPayer           string
 }
 
+// Compile-time assertion that *S3v2 satisfies the Storage interface, so any
+// missing port surfaces as a build error rather than a runtime nil-method.
+var _ Storage = (*S3v2)(nil)
+
 // generateRetryIDStr returns a fresh retry ID as a string. v2 stores object
 // metadata as map[string]string (no pointers), so this differs from the v1
 // generateRetryID helper which returned *string.
