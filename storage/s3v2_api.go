@@ -47,10 +47,29 @@ func generateRetryIDStr() string {
 // newS3StorageV2 builds a v2-backed S3 storage handle. Mirrors newS3Storage
 // and is used during incremental migration; once all methods are ported and
 // callers swap, this becomes the sole constructor.
+//
+// Region resolution: when opts.region is empty and opts.bucket is set, the
+// bucket's region is auto-discovered against a temporary us-east-1 client
+// (matches v1 setSessionRegion behavior). The resolved region is then folded
+// into opts before constructing the cached client, so cache lookups for the
+// same bucket reuse the same regional client.
 func newS3StorageV2(ctx context.Context, opts Options) (*S3v2, error) {
 	endpointURL, err := parseEndpoint(opts.Endpoint)
 	if err != nil {
 		return nil, err
+	}
+
+	if opts.region == "" && opts.bucket != "" {
+		region, rerr := resolveBucketRegionV2(ctx, opts)
+		if rerr != nil {
+			// Don't deny the request: surface to logs and let the actual
+			// operation report the underlying error in context (matches v1).
+			log.Error(log.ErrorMessage{
+				Err: fmt.Sprintf("session: fetching region failed: %v", rerr),
+			})
+		} else if region != "" {
+			opts.region = region
+		}
 	}
 
 	client, err := globalClientCacheV2.newClient(ctx, opts)
@@ -68,6 +87,36 @@ func newS3StorageV2(ctx context.Context, opts Options) (*S3v2, error) {
 		requestPayer:           opts.RequestPayer,
 		noSuchUploadRetryCount: opts.NoSuchUploadRetryCount,
 	}, nil
+}
+
+// resolveBucketRegionV2 discovers the region of opts.bucket using a
+// throwaway us-east-1 client that bypasses the per-Options cache (the cache
+// would otherwise pin the client to the wrong region).
+func resolveBucketRegionV2(ctx context.Context, opts Options) (string, error) {
+	probe := opts
+	probe.region = "us-east-1"
+	probe.bucket = "" // skip the recursion guard
+
+	client, err := globalClientCacheV2.newClient(ctx, probe)
+	if err != nil {
+		return "", err
+	}
+
+	region, err := manager.GetBucketRegion(ctx, client, opts.bucket, func(o *s3v2.Options) {
+		// HeadBucket via path-style is the safest fallback for S3-compat
+		// backends; v1's setSessionRegion did the same.
+		o.UsePathStyle = true
+	})
+	if err != nil {
+		// BucketNotFound is the one case we propagate so callers can
+		// distinguish "wrong region" from "real 404".
+		var notFound manager.BucketNotFound
+		if errors.As(err, &notFound) {
+			return "", err
+		}
+		return "", err
+	}
+	return region, nil
 }
 
 func (s *S3v2) requestPayerEnum() s3types.RequestPayer {
