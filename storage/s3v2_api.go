@@ -126,9 +126,34 @@ func resolveBucketRegion(ctx context.Context, opts Options) (string, error) {
 	return region, nil
 }
 
+// cleanedAPIErr wraps a smithy.APIError so callers see a v1-style
+// "Code: Message" string while errors.As(err, &apiErr) still surfaces the
+// underlying smithy.APIError for classification (NoSuchKey / NoSuchBucket /
+// AccessDenied checks in command/sync).
+type cleanedAPIErr struct {
+	wrapped smithy.APIError
+}
+
+func (e *cleanedAPIErr) Error() string {
+	msg := e.wrapped.ErrorMessage()
+	if msg == "" {
+		return e.wrapped.ErrorCode()
+	}
+	return e.wrapped.ErrorCode() + ": " + msg
+}
+
+func (e *cleanedAPIErr) Unwrap() error {
+	if w, ok := e.wrapped.(error); ok {
+		return w
+	}
+	return nil
+}
+
 // cleanV2Err unwraps verbose smithy OperationError chains down to the inner
 // API error and returns a "Code: Message" formatted error. Preserves v1-era
 // error string shape that command-level UX and e2e regexes expect.
+// errors.As traversal still finds the underlying smithy.APIError so callers
+// like command/sync.shouldStopSync continue to classify by code.
 //
 // Returns the original error unchanged when no smithy.APIError is present
 // (e.g. local filesystem errors, context cancellation, network errors).
@@ -138,11 +163,7 @@ func cleanV2Err(err error) error {
 	}
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
-		msg := apiErr.ErrorMessage()
-		if msg == "" {
-			return fmt.Errorf("%s", apiErr.ErrorCode())
-		}
-		return fmt.Errorf("%s: %s", apiErr.ErrorCode(), msg)
+		return &cleanedAPIErr{wrapped: apiErr}
 	}
 	return err
 }
