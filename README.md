@@ -2,6 +2,16 @@
 
 ![](./doc/s5cmd_header.jpg)
 
+> **Fork notice (babs/s5cmd):** this fork tracks the upstream `peak/s5cmd`
+> codebase but has been migrated from the deprecated `aws-sdk-go` (v1, end of
+> support 2025-07-31) to `aws-sdk-go-v2`. Behavior should match upstream for
+> AWS S3, MinIO, Cloudflare R2, Wasabi, Backblaze B2, and DigitalOcean Spaces.
+> Google Cloud Storage is supported via a request-signing workaround (see the
+> [GCS section](#google-cloud-storage-support)). Integrity-verification details
+> below describe upstream v1 behavior; the v2-backed binary delegates request
+> and response checksum policy to the v2 SDK and may differ in specifics. No
+> benchmarks have been re-run against the v2 backend (the figures shown in the
+> [Benchmarks](#benchmarks) section are upstream's v1-era results).
 
 ## Overview
 `s5cmd` is a very fast S3 and local filesystem execution tool. It comes with support
@@ -142,8 +152,9 @@ against each matching object, in parallel.
 
 ### Specifying credentials
 
-`s5cmd` uses official AWS SDK to access S3. SDK requires credentials to sign
-requests to AWS. Credentials can be provided in a [variety of ways](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html):
+`s5cmd` uses the official AWS SDK for Go (v2) to access S3. The SDK requires
+credentials to sign requests to AWS. Credentials can be provided in a
+[variety of ways](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html):
 
 - Command line options `--profile` to use a named profile, `--credentials-file` flag to use the specified credentials file
 
@@ -566,6 +577,18 @@ all variants will return your GCS buckets.
 acceleration and GCS. If a custom endpoint is provided, it'll fallback to
 path-style.
 
+> **GCS + aws-sdk-go-v2 caveat (this fork):** v2 of the AWS SDK includes
+> `Amz-Sdk-Invocation-Id` and `Amz-Sdk-Request` in the SigV4 `SignedHeaders`
+> set, which GCS rejects with `SignatureDoesNotMatch` because GCS does not
+> echo those headers in the canonical request it reconstructs server-side
+> ([aws/aws-sdk-go-v2#1816](https://github.com/aws/aws-sdk-go-v2/issues/1816)).
+> When the configured endpoint hostname is `storage.googleapis.com`, this
+> fork transparently injects a Smithy `Finalize` middleware that strips
+> those two headers immediately before the signing step. AWS, MinIO, R2,
+> Wasabi, and other S3-compatible backends are untouched. GCS multi-delete
+> (`DeleteObjects`) is also unsupported by GCS itself; the storage layer
+> falls back to per-object `DeleteObject` automatically.
+
 ### Retry logic
 
 `s5cmd` uses an exponential backoff retry mechanism for transient or potential
@@ -577,6 +600,18 @@ via `--retry-count` flag.
 ℹ️ Enable debug level logging for displaying retryable errors.
 
 ### Integrity Verification
+
+> **Note (this fork):** the section below describes upstream's v1-SDK
+> behavior verbatim. The v2-SDK migration in this fork delegates request
+> and response checksum policy to `aws-sdk-go-v2`, which uses CRC32 by
+> default (configurable via the SDK's `RequestChecksumCalculation` /
+> `ResponseChecksumValidation` modes). Response checksum validation is
+> set to `WhenRequired` to avoid SDK warnings against S3-compatible
+> backends that do not emit checksums (gofakes3, MinIO, etc.). The
+> `Content-MD5` / `X-Amz-Content-Sha256` claims below may not reflect
+> the v2 backend's exact wire behavior; treat them as upstream
+> documentation pending re-verification.
+
 `s5cmd` verifies the integrity of files uploaded to Amazon S3 by checking the `Content-MD5` and `X-Amz-Content-Sha256` headers. These headers are added by the AWS SDK for both standard and multipart uploads.
 
 * `Content-MD5` is a checksum of the file's contents, calculated using the `MD5` algorithm.
@@ -688,6 +723,17 @@ s5cmd --numworkers 10 cp --concurrency 10 '/Users/foo/bar/*' s3://mybucket/foo/b
 If you have a few, large files to download, setting `--numworkers` to a very high value will not affect download speed. In this scenario setting `--concurrency` to a higher value may have a better impact on the download speed.
 
 ## Benchmarks
+
+> **Note (this fork):** the figures below are the upstream v1-era benchmarks
+> from Joshua Robinson's article. They have **not** been re-run against the
+> aws-sdk-go-v2 backend used in this fork. v2's transfer manager has slightly
+> different concurrency and buffer characteristics; absolute throughput on
+> the v2 backend may differ from the numbers shown. PR #478 in the upstream
+> repository (the original v2 migration attempt) reported flat-to-mixed
+> results in the same range, suggesting any difference is small, but treat
+> the figures as illustrative until a fresh benchmark is published for this
+> fork.
+
 Some benchmarks regarding the performance of `s5cmd` are introduced below. For more
 details refer to this [post](https://medium.com/@joshua_robinson/s5cmd-for-high-performance-object-storage-7071352cc09d)
 which is the source of the benchmarks to be presented.
