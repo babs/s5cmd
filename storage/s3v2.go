@@ -151,6 +151,11 @@ func (cc *clientCacheV2) newClient(ctx context.Context, opts Options) (*s3v2.Cli
 			o.BaseEndpoint = awsv2.String(ep)
 		})
 	}
+	if isGCSEndpoint(endpointURL) {
+		s3OptFns = append(s3OptFns, func(o *s3v2.Options) {
+			o.APIOptions = append(o.APIOptions, addGCSHeaderStripMiddleware)
+		})
+	}
 
 	client := s3v2.NewFromConfig(cfg, s3OptFns...)
 	cc.clients[opts] = client
