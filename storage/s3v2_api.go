@@ -160,3 +160,77 @@ func (s *S3v2) HeadObject(ctx context.Context, u *url.URL) (*Object, *Metadata, 
 	}
 	return obj, metadata, nil
 }
+
+// ListBuckets returns the buckets visible to the configured credentials,
+// optionally filtered by name prefix.
+func (s *S3v2) ListBuckets(ctx context.Context, prefix string) ([]Bucket, error) {
+	out, err := s.api.ListBuckets(ctx, &s3v2.ListBucketsInput{})
+	if err != nil {
+		return nil, err
+	}
+
+	var buckets []Bucket
+	for _, b := range out.Buckets {
+		name := awsv2.ToString(b.Name)
+		if prefix == "" || strings.HasPrefix(name, prefix) {
+			buckets = append(buckets, Bucket{
+				CreationDate: awsv2.ToTime(b.CreationDate),
+				Name:         name,
+			})
+		}
+	}
+	return buckets, nil
+}
+
+// MakeBucket creates an S3 bucket with the given name.
+func (s *S3v2) MakeBucket(ctx context.Context, name string) error {
+	if s.dryRun {
+		return nil
+	}
+
+	_, err := s.api.CreateBucket(ctx, &s3v2.CreateBucketInput{
+		Bucket: awsv2.String(name),
+	})
+	return err
+}
+
+// RemoveBucket removes an S3 bucket with the given name.
+func (s *S3v2) RemoveBucket(ctx context.Context, name string) error {
+	if s.dryRun {
+		return nil
+	}
+
+	_, err := s.api.DeleteBucket(ctx, &s3v2.DeleteBucketInput{
+		Bucket: awsv2.String(name),
+	})
+	return err
+}
+
+// SetBucketVersioning sets the versioning property of the bucket. The
+// versioningStatus value is the typed BucketVersioningStatus enum
+// ("Enabled" / "Suspended") in v2.
+func (s *S3v2) SetBucketVersioning(ctx context.Context, versioningStatus, bucket string) error {
+	if s.dryRun {
+		return nil
+	}
+
+	_, err := s.api.PutBucketVersioning(ctx, &s3v2.PutBucketVersioningInput{
+		Bucket: awsv2.String(bucket),
+		VersioningConfiguration: &s3types.VersioningConfiguration{
+			Status: s3types.BucketVersioningStatus(versioningStatus),
+		},
+	})
+	return err
+}
+
+// GetBucketVersioning returns the versioning property of the bucket. Empty
+// string indicates "never enabled" (S3 returns no Status field in that case).
+func (s *S3v2) GetBucketVersioning(ctx context.Context, bucket string) (string, error) {
+	out, err := s.api.GetBucketVersioning(ctx, &s3v2.GetBucketVersioningInput{
+		Bucket: awsv2.String(bucket),
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(out.Status), nil
+}
