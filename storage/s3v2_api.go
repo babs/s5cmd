@@ -112,15 +112,39 @@ func resolveBucketRegion(ctx context.Context, opts Options) (string, error) {
 		o.UsePathStyle = true
 	})
 	if err != nil {
-		// BucketNotFound is the one case we propagate so callers can
-		// distinguish "wrong region" from "real 404".
+		// BucketNotFound is the bucket genuinely not existing in any
+		// reachable partition. Don't surface as a region-detection
+		// failure: the actual operation (HeadBucket, etc.) will report
+		// the NotFound itself, and double-logging confuses callers /
+		// breaks e2e regex expectations.
 		var notFound manager.BucketNotFound
 		if errors.As(err, &notFound) {
-			return "", err
+			return "", nil
 		}
 		return "", err
 	}
 	return region, nil
+}
+
+// cleanV2Err unwraps verbose smithy OperationError chains down to the inner
+// API error and returns a "Code: Message" formatted error. Preserves v1-era
+// error string shape that command-level UX and e2e regexes expect.
+//
+// Returns the original error unchanged when no smithy.APIError is present
+// (e.g. local filesystem errors, context cancellation, network errors).
+func cleanV2Err(err error) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		msg := apiErr.ErrorMessage()
+		if msg == "" {
+			return fmt.Errorf("%s", apiErr.ErrorCode())
+		}
+		return fmt.Errorf("%s: %s", apiErr.ErrorCode(), msg)
+	}
+	return err
 }
 
 func (s *S3) requestPayerEnum() s3types.RequestPayer {
@@ -163,7 +187,7 @@ func (s *S3) Stat(ctx context.Context, u *url.URL) (*Object, error) {
 		if errIsNotFound(err) {
 			return nil, &ErrGivenObjectNotFound{ObjectAbsPath: u.Absolute()}
 		}
-		return nil, err
+		return nil, cleanV2Err(err)
 	}
 
 	mod := awsv2.ToTime(output.LastModified)
@@ -188,7 +212,7 @@ func (s *S3) HeadBucket(ctx context.Context, u *url.URL) error {
 	_, err := s.api.HeadBucket(ctx, &s3v2.HeadBucketInput{
 		Bucket: awsv2.String(u.Bucket),
 	})
-	return err
+	return cleanV2Err(err)
 }
 
 // HeadObject returns Object + Metadata for a single key; ErrGivenObjectNotFound
@@ -208,7 +232,7 @@ func (s *S3) HeadObject(ctx context.Context, u *url.URL) (*Object, *Metadata, er
 		if errIsNotFound(err) {
 			return nil, nil, &ErrGivenObjectNotFound{ObjectAbsPath: u.Absolute()}
 		}
-		return nil, nil, err
+		return nil, nil, cleanV2Err(err)
 	}
 
 	// STANDARD storage class is omitted from the response per S3 API spec.
@@ -246,7 +270,7 @@ func (s *S3) HeadObject(ctx context.Context, u *url.URL) (*Object, *Metadata, er
 func (s *S3) ListBuckets(ctx context.Context, prefix string) ([]Bucket, error) {
 	out, err := s.api.ListBuckets(ctx, &s3v2.ListBucketsInput{})
 	if err != nil {
-		return nil, err
+		return nil, cleanV2Err(err)
 	}
 
 	var buckets []Bucket
@@ -271,7 +295,7 @@ func (s *S3) MakeBucket(ctx context.Context, name string) error {
 	_, err := s.api.CreateBucket(ctx, &s3v2.CreateBucketInput{
 		Bucket: awsv2.String(name),
 	})
-	return err
+	return cleanV2Err(err)
 }
 
 // RemoveBucket removes an S3 bucket with the given name.
@@ -283,7 +307,7 @@ func (s *S3) RemoveBucket(ctx context.Context, name string) error {
 	_, err := s.api.DeleteBucket(ctx, &s3v2.DeleteBucketInput{
 		Bucket: awsv2.String(name),
 	})
-	return err
+	return cleanV2Err(err)
 }
 
 // SetBucketVersioning sets the versioning property of the bucket. The
@@ -300,7 +324,7 @@ func (s *S3) SetBucketVersioning(ctx context.Context, versioningStatus, bucket s
 			Status: s3types.BucketVersioningStatus(versioningStatus),
 		},
 	})
-	return err
+	return cleanV2Err(err)
 }
 
 // GetBucketVersioning returns the versioning property of the bucket. Empty
@@ -310,7 +334,7 @@ func (s *S3) GetBucketVersioning(ctx context.Context, bucket string) (string, er
 		Bucket: awsv2.String(bucket),
 	})
 	if err != nil {
-		return "", err
+		return "", cleanV2Err(err)
 	}
 	return string(out.Status), nil
 }
@@ -395,7 +419,7 @@ func (s *S3) doDelete(ctx context.Context, c chunkV2, resultch chan *Object) {
 				RequestPayer: s.requestPayerEnum(),
 			})
 			if err != nil {
-				resultch <- &Object{Err: err}
+				resultch <- &Object{Err: cleanV2Err(err)}
 				return
 			}
 			key := fmt.Sprintf("s3://%v/%v", c.Bucket, awsv2.ToString(k.Key))
@@ -411,7 +435,7 @@ func (s *S3) doDelete(ctx context.Context, c chunkV2, resultch chan *Object) {
 		RequestPayer: s.requestPayerEnum(),
 	})
 	if err != nil {
-		resultch <- &Object{Err: err}
+		resultch <- &Object{Err: cleanV2Err(err)}
 		return
 	}
 
@@ -469,7 +493,7 @@ func (s *S3) listObjectsV2(ctx context.Context, u *url.URL) <-chan *Object {
 		for paginator.HasMorePages() {
 			page, err := paginator.NextPage(ctx)
 			if err != nil {
-				objCh <- &Object{Err: err}
+				objCh <- &Object{Err: cleanV2Err(err)}
 				return
 			}
 
@@ -549,7 +573,7 @@ func (s *S3) listObjects(ctx context.Context, u *url.URL) <-chan *Object {
 			in.Marker = marker
 			page, err := s.api.ListObjects(ctx, in)
 			if err != nil {
-				objCh <- &Object{Err: err}
+				objCh <- &Object{Err: cleanV2Err(err)}
 				return
 			}
 
@@ -640,7 +664,7 @@ func (s *S3) listObjectVersions(ctx context.Context, u *url.URL) <-chan *Object 
 		for paginator.HasMorePages() {
 			page, err := paginator.NextPage(ctx)
 			if err != nil {
-				objCh <- &Object{Err: err}
+				objCh <- &Object{Err: cleanV2Err(err)}
 				return
 			}
 
@@ -815,7 +839,7 @@ func (s *S3) Copy(ctx context.Context, from, to *url.URL, metadata Metadata) err
 	}
 
 	_, err := s.api.CopyObject(ctx, input)
-	return err
+	return cleanV2Err(err)
 }
 
 // Read fetches the remote object and returns its body as an io.ReadCloser.
@@ -831,7 +855,7 @@ func (s *S3) Read(ctx context.Context, src *url.URL) (io.ReadCloser, error) {
 
 	resp, err := s.api.GetObject(ctx, input)
 	if err != nil {
-		return nil, err
+		return nil, cleanV2Err(err)
 	}
 	return resp.Body, nil
 }
@@ -849,7 +873,7 @@ func (s *S3) Presign(ctx context.Context, from *url.URL, expire time.Duration) (
 	})
 	req, err := presigner.PresignGetObject(ctx, input)
 	if err != nil {
-		return "", err
+		return "", cleanV2Err(err)
 	}
 	return req.URL, nil
 }
@@ -877,10 +901,11 @@ func (s *S3) Get(
 		input.VersionId = awsv2.String(from.VersionID)
 	}
 
-	return s.downloader.Download(ctx, to, input, func(d *manager.Downloader) {
+	n, err := s.downloader.Download(ctx, to, input, func(d *manager.Downloader) {
 		d.PartSize = partSize
 		d.Concurrency = concurrency
 	})
+	return n, cleanV2Err(err)
 }
 
 // Put uploads the contents of reader to the destination via the v2 transfer
@@ -956,9 +981,9 @@ func (s *S3) Put(
 
 	_, err := s.uploader.Upload(ctx, input, uploaderOptsFn)
 	if errIsNoSuchUpload(err) && s.noSuchUploadRetryCount > 0 {
-		return s.retryOnNoSuchUpload(ctx, to, input, err, uploaderOptsFn)
+		return cleanV2Err(s.retryOnNoSuchUpload(ctx, to, input, err, uploaderOptsFn))
 	}
-	return err
+	return cleanV2Err(err)
 }
 
 // retryOnNoSuchUpload re-attempts the upload up to noSuchUploadRetryCount
@@ -1091,7 +1116,7 @@ func (s *S3) Select(ctx context.Context, u *url.URL, query *SelectQuery, resultC
 		OutputSerialization: outputFormat,
 	})
 	if err != nil {
-		return err
+		return cleanV2Err(err)
 	}
 
 	stream := resp.GetStream()
@@ -1127,7 +1152,7 @@ func (s *S3) Select(ctx context.Context, u *url.URL, query *SelectQuery, resultC
 		resultCh <- val
 	}
 
-	return stream.Err()
+	return cleanV2Err(stream.Err())
 }
 
 // MultiDelete asynchronously removes objects from the input channel,
