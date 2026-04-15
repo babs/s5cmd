@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	urlpkg "net/url"
+	"os"
 	"strings"
 	"sync"
+	"time"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
 	s3v2 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -352,6 +354,307 @@ func (s *S3v2) doDelete(ctx context.Context, c chunkV2, resultch chan *Object) {
 			Err: fmt.Errorf("%v", awsv2.ToString(e.Message)),
 		}
 	}
+}
+
+// List dispatches to a paginator variant based on URL flags.
+//
+// followSymlinks is unused for S3 (only meaningful on local FS), kept to
+// satisfy the Storage interface.
+func (s *S3v2) List(ctx context.Context, u *url.URL, _ bool) <-chan *Object {
+	if u.VersionID != "" || u.AllVersions {
+		return s.listObjectVersions(ctx, u)
+	}
+	if s.useListObjectsV1 {
+		return s.listObjects(ctx, u)
+	}
+	return s.listObjectsV2(ctx, u)
+}
+
+// listObjectsV2 paginates ListObjectsV2; matches v1 listObjectsV2 semantics
+// (skip future-dated objects, emit dirs for common prefixes, ErrNoObjectFound
+// when the result set is empty for a non-bucket URL).
+func (s *S3v2) listObjectsV2(ctx context.Context, u *url.URL) <-chan *Object {
+	in := &s3v2.ListObjectsV2Input{
+		Bucket:       awsv2.String(u.Bucket),
+		Prefix:       awsv2.String(u.Prefix),
+		RequestPayer: s.requestPayerEnum(),
+	}
+	if u.Delimiter != "" {
+		in.Delimiter = awsv2.String(u.Delimiter)
+	}
+
+	objCh := make(chan *Object)
+	go func() {
+		defer close(objCh)
+		objectFound := false
+		var now time.Time
+
+		paginator := s3v2.NewListObjectsV2Paginator(s.api, in)
+		for paginator.HasMorePages() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				objCh <- &Object{Err: err}
+				return
+			}
+
+			for _, c := range page.CommonPrefixes {
+				prefix := awsv2.ToString(c.Prefix)
+				if !u.Match(prefix) {
+					continue
+				}
+				newurl := u.Clone()
+				newurl.Path = prefix
+				objCh <- &Object{URL: newurl, Type: ObjectType{os.ModeDir}}
+				objectFound = true
+			}
+
+			if now.IsZero() {
+				now = time.Now().UTC()
+			}
+
+			for _, c := range page.Contents {
+				key := awsv2.ToString(c.Key)
+				if !u.Match(key) {
+					continue
+				}
+				mod := awsv2.ToTime(c.LastModified).UTC()
+				if mod.After(now) {
+					objectFound = true
+					continue
+				}
+
+				var objtype os.FileMode
+				if strings.HasSuffix(key, "/") {
+					objtype = os.ModeDir
+				}
+
+				newurl := u.Clone()
+				newurl.Path = key
+				objCh <- &Object{
+					URL:          newurl,
+					Etag:         strings.Trim(awsv2.ToString(c.ETag), `"`),
+					ModTime:      &mod,
+					Type:         ObjectType{objtype},
+					Size:         awsv2.ToInt64(c.Size),
+					StorageClass: StorageClass(c.StorageClass),
+				}
+				objectFound = true
+			}
+		}
+
+		if !objectFound && !u.IsBucket() {
+			objCh <- &Object{Err: ErrNoObjectFound}
+		}
+	}()
+	return objCh
+}
+
+// listObjects is the v1 ListObjects fallback for backends that do not
+// implement ListObjectsV2 (notably GCS).
+func (s *S3v2) listObjects(ctx context.Context, u *url.URL) <-chan *Object {
+	in := &s3v2.ListObjectsInput{
+		Bucket:       awsv2.String(u.Bucket),
+		Prefix:       awsv2.String(u.Prefix),
+		RequestPayer: s.requestPayerEnum(),
+	}
+	if u.Delimiter != "" {
+		in.Delimiter = awsv2.String(u.Delimiter)
+	}
+
+	objCh := make(chan *Object)
+	go func() {
+		defer close(objCh)
+		objectFound := false
+		var now time.Time
+
+		// v2 has no paginator for ListObjects (v1 API); iterate via Marker.
+		var marker *string
+		for {
+			in.Marker = marker
+			page, err := s.api.ListObjects(ctx, in)
+			if err != nil {
+				objCh <- &Object{Err: err}
+				return
+			}
+
+			for _, c := range page.CommonPrefixes {
+				prefix := awsv2.ToString(c.Prefix)
+				if !u.Match(prefix) {
+					continue
+				}
+				newurl := u.Clone()
+				newurl.Path = prefix
+				objCh <- &Object{URL: newurl, Type: ObjectType{os.ModeDir}}
+				objectFound = true
+			}
+
+			if now.IsZero() {
+				now = time.Now().UTC()
+			}
+
+			for _, c := range page.Contents {
+				key := awsv2.ToString(c.Key)
+				if !u.Match(key) {
+					continue
+				}
+				mod := awsv2.ToTime(c.LastModified).UTC()
+				if mod.After(now) {
+					objectFound = true
+					continue
+				}
+
+				var objtype os.FileMode
+				if strings.HasSuffix(key, "/") {
+					objtype = os.ModeDir
+				}
+
+				newurl := u.Clone()
+				newurl.Path = key
+				objCh <- &Object{
+					URL:          newurl,
+					Etag:         strings.Trim(awsv2.ToString(c.ETag), `"`),
+					ModTime:      &mod,
+					Type:         ObjectType{objtype},
+					Size:         awsv2.ToInt64(c.Size),
+					StorageClass: StorageClass(c.StorageClass),
+				}
+				objectFound = true
+			}
+
+			if !awsv2.ToBool(page.IsTruncated) {
+				break
+			}
+			// S3 returns NextMarker only when delimiter is set; otherwise the
+			// last key from Contents is the next marker.
+			if page.NextMarker != nil {
+				marker = page.NextMarker
+			} else if len(page.Contents) > 0 {
+				marker = page.Contents[len(page.Contents)-1].Key
+			} else {
+				break
+			}
+		}
+
+		if !objectFound && !u.IsBucket() {
+			objCh <- &Object{Err: ErrNoObjectFound}
+		}
+	}()
+	return objCh
+}
+
+// listObjectVersions paginates ListObjectVersions, emitting objects, version
+// markers, and delete markers. Matches v1 semantics including the version-id
+// filter and the future-dated-object skip.
+func (s *S3v2) listObjectVersions(ctx context.Context, u *url.URL) <-chan *Object {
+	in := &s3v2.ListObjectVersionsInput{
+		Bucket: awsv2.String(u.Bucket),
+		Prefix: awsv2.String(u.Prefix),
+	}
+	if u.Delimiter != "" {
+		in.Delimiter = awsv2.String(u.Delimiter)
+	}
+
+	objCh := make(chan *Object)
+	go func() {
+		defer close(objCh)
+		objectFound := false
+		var now time.Time
+
+		paginator := s3v2.NewListObjectVersionsPaginator(s.api, in)
+		for paginator.HasMorePages() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				objCh <- &Object{Err: err}
+				return
+			}
+
+			for _, c := range page.CommonPrefixes {
+				prefix := awsv2.ToString(c.Prefix)
+				if !u.Match(prefix) {
+					continue
+				}
+				newurl := u.Clone()
+				newurl.Path = prefix
+				objCh <- &Object{URL: newurl, Type: ObjectType{os.ModeDir}}
+				objectFound = true
+			}
+
+			if now.IsZero() {
+				now = time.Now().UTC()
+			}
+
+			for _, v := range page.Versions {
+				key := awsv2.ToString(v.Key)
+				if !u.Match(key) {
+					continue
+				}
+				if u.VersionID != "" && u.VersionID != awsv2.ToString(v.VersionId) {
+					continue
+				}
+
+				mod := awsv2.ToTime(v.LastModified).UTC()
+				if mod.After(now) {
+					objectFound = true
+					continue
+				}
+
+				var objtype os.FileMode
+				if strings.HasSuffix(key, "/") {
+					objtype = os.ModeDir
+				}
+
+				newurl := u.Clone()
+				newurl.Path = key
+				newurl.VersionID = awsv2.ToString(v.VersionId)
+				objCh <- &Object{
+					URL:          newurl,
+					Etag:         strings.Trim(awsv2.ToString(v.ETag), `"`),
+					ModTime:      &mod,
+					Type:         ObjectType{objtype},
+					Size:         awsv2.ToInt64(v.Size),
+					StorageClass: StorageClass(v.StorageClass),
+				}
+				objectFound = true
+			}
+
+			for _, d := range page.DeleteMarkers {
+				key := awsv2.ToString(d.Key)
+				if !u.Match(key) {
+					continue
+				}
+				if u.VersionID != "" && u.VersionID != awsv2.ToString(d.VersionId) {
+					continue
+				}
+
+				mod := awsv2.ToTime(d.LastModified).UTC()
+				if mod.After(now) {
+					objectFound = true
+					continue
+				}
+
+				var objtype os.FileMode
+				if strings.HasSuffix(key, "/") {
+					objtype = os.ModeDir
+				}
+
+				newurl := u.Clone()
+				newurl.Path = key
+				newurl.VersionID = awsv2.ToString(d.VersionId)
+				objCh <- &Object{
+					URL:     newurl,
+					ModTime: &mod,
+					Type:    ObjectType{objtype},
+					Size:    0,
+				}
+				objectFound = true
+			}
+		}
+
+		if !objectFound && !u.IsBucket() {
+			objCh <- &Object{Err: ErrNoObjectFound}
+		}
+	}()
+	return objCh
 }
 
 // MultiDelete asynchronously removes objects from the input channel,
