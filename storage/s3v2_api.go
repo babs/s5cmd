@@ -7,8 +7,10 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	urlpkg "net/url"
 	"strings"
+	"sync"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
 	s3v2 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -233,4 +235,149 @@ func (s *S3v2) GetBucketVersioning(ctx context.Context, bucket string) (string, 
 		return "", err
 	}
 	return string(out.Status), nil
+}
+
+// chunkV2 is the v2 equivalent of chunk{} -- holds a batch of object IDs to
+// delete. ObjectIdentifier in v2 is a value type rather than a pointer.
+type chunkV2 struct {
+	Bucket string
+	Keys   []s3types.ObjectIdentifier
+}
+
+// calculateChunks pulls URLs off ch and emits delete batches sized by S3's
+// 1000-key limit (1 for GCS, which does not support multi-delete).
+func (s *S3v2) calculateChunks(ch <-chan *url.URL) <-chan chunkV2 {
+	chunkch := make(chan chunkV2)
+	chunkSize := deleteObjectsMax
+	if IsGoogleEndpoint(s.endpointURL) {
+		chunkSize = 1
+	}
+
+	go func() {
+		defer close(chunkch)
+
+		var keys []s3types.ObjectIdentifier
+		var bucket string
+		for u := range ch {
+			bucket = u.Bucket
+			objid := s3types.ObjectIdentifier{Key: awsv2.String(u.Path)}
+			if u.VersionID != "" {
+				objid.VersionId = awsv2.String(u.VersionID)
+			}
+			keys = append(keys, objid)
+
+			if len(keys) == chunkSize {
+				chunkch <- chunkV2{Bucket: bucket, Keys: keys}
+				keys = nil
+			}
+		}
+		if len(keys) > 0 {
+			chunkch <- chunkV2{Bucket: bucket, Keys: keys}
+		}
+	}()
+
+	return chunkch
+}
+
+// Delete removes a single object.
+func (s *S3v2) Delete(ctx context.Context, u *url.URL) error {
+	c := chunkV2{
+		Bucket: u.Bucket,
+		Keys:   []s3types.ObjectIdentifier{{Key: awsv2.String(u.Path)}},
+	}
+	if u.VersionID != "" {
+		c.Keys[0].VersionId = awsv2.String(u.VersionID)
+	}
+
+	resultch := make(chan *Object, 1)
+	defer close(resultch)
+	s.doDelete(ctx, c, resultch)
+	obj := <-resultch
+	return obj.Err
+}
+
+// doDelete executes a single chunk against DeleteObjects (or per-object
+// DeleteObject for GCS, which does not implement the batch endpoint).
+func (s *S3v2) doDelete(ctx context.Context, c chunkV2, resultch chan *Object) {
+	if s.dryRun {
+		for _, k := range c.Keys {
+			key := fmt.Sprintf("s3://%v/%v", c.Bucket, awsv2.ToString(k.Key))
+			u, _ := url.New(key)
+			u.VersionID = awsv2.ToString(k.VersionId)
+			resultch <- &Object{URL: u}
+		}
+		return
+	}
+
+	if IsGoogleEndpoint(s.endpointURL) {
+		for _, k := range c.Keys {
+			_, err := s.api.DeleteObject(ctx, &s3v2.DeleteObjectInput{
+				Bucket:       awsv2.String(c.Bucket),
+				Key:          k.Key,
+				RequestPayer: s.requestPayerEnum(),
+			})
+			if err != nil {
+				resultch <- &Object{Err: err}
+				return
+			}
+			key := fmt.Sprintf("s3://%v/%v", c.Bucket, awsv2.ToString(k.Key))
+			u, _ := url.New(key)
+			resultch <- &Object{URL: u}
+		}
+		return
+	}
+
+	out, err := s.api.DeleteObjects(ctx, &s3v2.DeleteObjectsInput{
+		Bucket:       awsv2.String(c.Bucket),
+		Delete:       &s3types.Delete{Objects: c.Keys},
+		RequestPayer: s.requestPayerEnum(),
+	})
+	if err != nil {
+		resultch <- &Object{Err: err}
+		return
+	}
+
+	for _, d := range out.Deleted {
+		key := fmt.Sprintf("s3://%v/%v", c.Bucket, awsv2.ToString(d.Key))
+		u, _ := url.New(key)
+		u.VersionID = awsv2.ToString(d.VersionId)
+		resultch <- &Object{URL: u}
+	}
+	for _, e := range out.Errors {
+		key := fmt.Sprintf("s3://%v/%v", c.Bucket, awsv2.ToString(e.Key))
+		u, _ := url.New(key)
+		u.VersionID = awsv2.ToString(e.VersionId)
+		resultch <- &Object{
+			URL: u,
+			Err: fmt.Errorf("%v", awsv2.ToString(e.Message)),
+		}
+	}
+}
+
+// MultiDelete asynchronously removes objects from the input channel,
+// fan-out at most 10 in-flight DeleteObjects requests.
+func (s *S3v2) MultiDelete(ctx context.Context, urlch <-chan *url.URL) <-chan *Object {
+	resultch := make(chan *Object)
+
+	go func() {
+		sem := make(chan struct{}, 10)
+		defer close(sem)
+		defer close(resultch)
+
+		chunks := s.calculateChunks(urlch)
+		var wg sync.WaitGroup
+		for c := range chunks {
+			c := c
+			wg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer wg.Done()
+				s.doDelete(ctx, c, resultch)
+				<-sem
+			}()
+		}
+		wg.Wait()
+	}()
+
+	return resultch
 }
