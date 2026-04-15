@@ -6,6 +6,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -932,6 +933,140 @@ func (s *S3v2) retryOnNoSuchUpload(
 			attempts, err)
 	}
 	return err
+}
+
+// parseInputSerializationV2 builds the v2 InputSerialization for the given
+// query shape. v2 enums replace the v1 string fields:
+//
+//	JSONInput.Type           -> types.JSONType
+//	CSVInput.FileHeaderInfo  -> types.FileHeaderInfo
+//	InputSerialization.CompressionType -> types.CompressionType
+//
+// CSVInput.FieldDelimiter remains *string (no enum).
+func parseInputSerializationV2(e eventType, compression, delimiter, headerInfo string) (*s3types.InputSerialization, error) {
+	switch e {
+	case jsonType:
+		in := &s3types.InputSerialization{
+			JSON: &s3types.JSONInput{
+				Type: s3types.JSONType(delimiter),
+			},
+		}
+		if compression != "" {
+			in.CompressionType = s3types.CompressionType(compression)
+		}
+		return in, nil
+	case csvType:
+		in := &s3types.InputSerialization{
+			CSV: &s3types.CSVInput{
+				FieldDelimiter: awsv2.String(delimiter),
+				FileHeaderInfo: s3types.FileHeaderInfo(headerInfo),
+			},
+		}
+		if compression != "" {
+			in.CompressionType = s3types.CompressionType(compression)
+		}
+		return in, nil
+	case parquetType:
+		return &s3types.InputSerialization{Parquet: &s3types.ParquetInput{}}, nil
+	default:
+		return nil, fmt.Errorf("input format is not valid")
+	}
+}
+
+func parseOutputSerializationV2(e eventType, delimiter string, reader io.Reader) (*s3types.OutputSerialization, EventStreamDecoder, error) {
+	switch e {
+	case jsonType:
+		return &s3types.OutputSerialization{JSON: &s3types.JSONOutput{}}, NewJSONDecoder(reader), nil
+	case csvType:
+		return &s3types.OutputSerialization{
+			CSV: &s3types.CSVOutput{FieldDelimiter: awsv2.String(delimiter)},
+		}, NewCsvDecoder(reader), nil
+	default:
+		return nil, nil, fmt.Errorf("output serialization is not valid")
+	}
+}
+
+// Select streams S3 Select results into resultCh. Tagged-union event handling
+// in v2: types.SelectObjectContentEventStream is an interface; the records
+// payload arrives as *types.SelectObjectContentEventStreamMemberRecords.
+func (s *S3v2) Select(ctx context.Context, u *url.URL, query *SelectQuery, resultCh chan<- json.RawMessage) error {
+	if s.dryRun {
+		return nil
+	}
+
+	reader, writer := io.Pipe()
+
+	inputFormat, err := parseInputSerializationV2(
+		eventType(query.InputFormat),
+		query.CompressionType,
+		query.InputContentStructure,
+		query.FileHeaderInfo,
+	)
+	if err != nil {
+		return err
+	}
+
+	// JSON->CSV requires a comma delimiter on the input side; v1 patched the
+	// query in-place, preserve that behavior.
+	if query.InputFormat == string(jsonType) && query.OutputFormat == string(csvType) {
+		query.InputContentStructure = ","
+	}
+
+	outputFormat, decoder, err := parseOutputSerializationV2(
+		eventType(query.OutputFormat),
+		query.InputContentStructure,
+		reader,
+	)
+	if err != nil {
+		return err
+	}
+
+	resp, err := s.api.SelectObjectContent(ctx, &s3v2.SelectObjectContentInput{
+		Bucket:              awsv2.String(u.Bucket),
+		Key:                 awsv2.String(u.Path),
+		ExpressionType:      s3types.ExpressionType(query.ExpressionType),
+		Expression:          awsv2.String(query.Expression),
+		InputSerialization:  inputFormat,
+		OutputSerialization: outputFormat,
+	})
+	if err != nil {
+		return err
+	}
+
+	stream := resp.GetStream()
+
+	go func() {
+		defer writer.Close()
+		defer stream.Close()
+
+		eventch := stream.Events()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event, ok := <-eventch:
+				if !ok {
+					return
+				}
+				if rec, ok := event.(*s3types.SelectObjectContentEventStreamMemberRecords); ok {
+					writer.Write(rec.Value.Payload)
+				}
+			}
+		}
+	}()
+
+	for {
+		val, err := decoder.Decode()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		resultCh <- val
+	}
+
+	return stream.Err()
 }
 
 // MultiDelete asynchronously removes objects from the input channel,
