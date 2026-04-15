@@ -2,6 +2,7 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -9,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/smithy-go"
 	"github.com/hashicorp/go-multierror"
 	"github.com/lanrat/extsort"
 	"github.com/urfave/cli/v2"
@@ -592,8 +593,9 @@ func (s Sync) shouldStopSync(err error) bool {
 	if err == storage.ErrNoObjectFound {
 		return false
 	}
-	if awsErr, ok := err.(awserr.Error); ok {
-		switch awsErr.Code() {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
 		case "AccessDenied", "NoSuchBucket":
 			return true
 		}
