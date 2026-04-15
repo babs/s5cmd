@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	urlpkg "net/url"
 	"os"
 	"strings"
@@ -15,20 +16,31 @@ import (
 	"time"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	s3v2 "github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/peak/s5cmd/v2/log"
 	"github.com/peak/s5cmd/v2/storage/url"
 )
 
 type S3v2 struct {
 	api                    *s3v2.Client
+	uploader               *manager.Uploader
+	downloader             *manager.Downloader
 	endpointURL            urlpkg.URL
 	dryRun                 bool
 	useListObjectsV1       bool
 	noSuchUploadRetryCount int
 	requestPayer           string
+}
+
+// generateRetryIDStr returns a fresh retry ID as a string. v2 stores object
+// metadata as map[string]string (no pointers), so this differs from the v1
+// generateRetryID helper which returned *string.
+func generateRetryIDStr() string {
+	return awsv2.ToString(generateRetryID())
 }
 
 // newS3StorageV2 builds a v2-backed S3 storage handle. Mirrors newS3Storage
@@ -47,6 +59,8 @@ func newS3StorageV2(ctx context.Context, opts Options) (*S3v2, error) {
 
 	return &S3v2{
 		api:                    client,
+		uploader:               manager.NewUploader(client),
+		downloader:             manager.NewDownloader(client),
 		endpointURL:            endpointURL,
 		dryRun:                 opts.DryRun,
 		useListObjectsV1:       opts.UseListObjectsV1,
@@ -655,6 +669,269 @@ func (s *S3v2) listObjectVersions(ctx context.Context, u *url.URL) <-chan *Objec
 		}
 	}()
 	return objCh
+}
+
+// errIsNoSuchUpload reports whether err is the NoSuchUpload condition that
+// triggers s5cmd's idempotent multipart-upload retry workaround.
+func errIsNoSuchUpload(err error) bool {
+	var noSuchUpload *s3types.NoSuchUpload
+	if errors.As(err, &noSuchUpload) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchUpload" {
+		return true
+	}
+	return false
+}
+
+// Copy is a server-side copy from one S3 object to another.
+func (s *S3v2) Copy(ctx context.Context, from, to *url.URL, metadata Metadata) error {
+	if s.dryRun {
+		return nil
+	}
+
+	// CopySource format: "bucket/key" -- v2 still requires the version-id
+	// query suffix appended to the source string rather than as a field.
+	copySource := from.EscapedPath()
+	if from.VersionID != "" {
+		copySource = copySource + "?versionId=" + from.VersionID
+	}
+
+	input := &s3v2.CopyObjectInput{
+		Bucket:       awsv2.String(to.Bucket),
+		Key:          awsv2.String(to.Path),
+		CopySource:   awsv2.String(copySource),
+		RequestPayer: s.requestPayerEnum(),
+	}
+
+	if metadata.StorageClass != "" {
+		input.StorageClass = s3types.StorageClass(metadata.StorageClass)
+	}
+	if metadata.ACL != "" {
+		input.ACL = s3types.ObjectCannedACL(metadata.ACL)
+	}
+	if metadata.CacheControl != "" {
+		input.CacheControl = awsv2.String(metadata.CacheControl)
+	}
+	if metadata.Expires != "" {
+		t, err := time.Parse(time.RFC3339, metadata.Expires)
+		if err != nil {
+			return err
+		}
+		input.Expires = awsv2.Time(t)
+	}
+	if metadata.EncryptionMethod != "" {
+		input.ServerSideEncryption = s3types.ServerSideEncryption(metadata.EncryptionMethod)
+		if metadata.EncryptionKeyID != "" {
+			input.SSEKMSKeyId = awsv2.String(metadata.EncryptionKeyID)
+		}
+	}
+	if metadata.ContentEncoding != "" {
+		input.ContentEncoding = awsv2.String(metadata.ContentEncoding)
+	}
+	if metadata.ContentDisposition != "" {
+		input.ContentDisposition = awsv2.String(metadata.ContentDisposition)
+	}
+	if metadata.Directive != "" {
+		input.MetadataDirective = s3types.MetadataDirective(metadata.Directive)
+	}
+	if metadata.ContentType != "" {
+		input.ContentType = awsv2.String(metadata.ContentType)
+	}
+	if len(metadata.UserDefined) != 0 {
+		input.Metadata = make(map[string]string, len(metadata.UserDefined))
+		for k, v := range metadata.UserDefined {
+			input.Metadata[k] = v
+		}
+	}
+	if s.noSuchUploadRetryCount > 0 {
+		if input.Metadata == nil {
+			input.Metadata = make(map[string]string)
+		}
+		input.Metadata[metadataKeyRetryID] = generateRetryIDStr()
+	}
+
+	_, err := s.api.CopyObject(ctx, input)
+	return err
+}
+
+// Read fetches the remote object and returns its body as an io.ReadCloser.
+func (s *S3v2) Read(ctx context.Context, src *url.URL) (io.ReadCloser, error) {
+	input := &s3v2.GetObjectInput{
+		Bucket:       awsv2.String(src.Bucket),
+		Key:          awsv2.String(src.Path),
+		RequestPayer: s.requestPayerEnum(),
+	}
+	if src.VersionID != "" {
+		input.VersionId = awsv2.String(src.VersionID)
+	}
+
+	resp, err := s.api.GetObject(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// Presign produces a time-limited URL for a GetObject request.
+func (s *S3v2) Presign(ctx context.Context, from *url.URL, expire time.Duration) (string, error) {
+	input := &s3v2.GetObjectInput{
+		Bucket:       awsv2.String(from.Bucket),
+		Key:          awsv2.String(from.Path),
+		RequestPayer: s.requestPayerEnum(),
+	}
+
+	presigner := s3v2.NewPresignClient(s.api, func(o *s3v2.PresignOptions) {
+		o.Expires = expire
+	})
+	req, err := presigner.PresignGetObject(ctx, input)
+	if err != nil {
+		return "", err
+	}
+	return req.URL, nil
+}
+
+// Get is a parallel multipart download via the v2 transfer manager.
+// Concurrency==1 collapses to a single GetObject (partSize ignored), matching
+// v1 behavior.
+func (s *S3v2) Get(
+	ctx context.Context,
+	from *url.URL,
+	to io.WriterAt,
+	concurrency int,
+	partSize int64,
+) (int64, error) {
+	if s.dryRun {
+		return 0, nil
+	}
+
+	input := &s3v2.GetObjectInput{
+		Bucket:       awsv2.String(from.Bucket),
+		Key:          awsv2.String(from.Path),
+		RequestPayer: s.requestPayerEnum(),
+	}
+	if from.VersionID != "" {
+		input.VersionId = awsv2.String(from.VersionID)
+	}
+
+	return s.downloader.Download(ctx, to, input, func(d *manager.Downloader) {
+		d.PartSize = partSize
+		d.Concurrency = concurrency
+	})
+}
+
+// Put uploads the contents of reader to the destination via the v2 transfer
+// manager. On NoSuchUpload (race with concurrent multipart abort) the
+// configured number of idempotent retries is attempted, mirroring v1.
+func (s *S3v2) Put(
+	ctx context.Context,
+	reader io.Reader,
+	to *url.URL,
+	metadata Metadata,
+	concurrency int,
+	partSize int64,
+) error {
+	if s.dryRun {
+		return nil
+	}
+
+	contentType := metadata.ContentType
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	input := &s3v2.PutObjectInput{
+		Bucket:       awsv2.String(to.Bucket),
+		Key:          awsv2.String(to.Path),
+		Body:         reader,
+		ContentType:  awsv2.String(contentType),
+		Metadata:     make(map[string]string),
+		RequestPayer: s.requestPayerEnum(),
+	}
+
+	if metadata.StorageClass != "" {
+		input.StorageClass = s3types.StorageClass(metadata.StorageClass)
+	}
+	if metadata.ACL != "" {
+		input.ACL = s3types.ObjectCannedACL(metadata.ACL)
+	}
+	if metadata.CacheControl != "" {
+		input.CacheControl = awsv2.String(metadata.CacheControl)
+	}
+	if metadata.Expires != "" {
+		t, err := time.Parse(time.RFC3339, metadata.Expires)
+		if err != nil {
+			return err
+		}
+		input.Expires = awsv2.Time(t)
+	}
+	if metadata.EncryptionMethod != "" {
+		input.ServerSideEncryption = s3types.ServerSideEncryption(metadata.EncryptionMethod)
+		if metadata.EncryptionKeyID != "" {
+			input.SSEKMSKeyId = awsv2.String(metadata.EncryptionKeyID)
+		}
+	}
+	if metadata.ContentEncoding != "" {
+		input.ContentEncoding = awsv2.String(metadata.ContentEncoding)
+	}
+	if metadata.ContentDisposition != "" {
+		input.ContentDisposition = awsv2.String(metadata.ContentDisposition)
+	}
+	if s.noSuchUploadRetryCount > 0 {
+		input.Metadata[metadataKeyRetryID] = generateRetryIDStr()
+	}
+	if len(metadata.UserDefined) != 0 {
+		for k, v := range metadata.UserDefined {
+			input.Metadata[k] = v
+		}
+	}
+
+	uploaderOptsFn := func(u *manager.Uploader) {
+		u.PartSize = partSize
+		u.Concurrency = concurrency
+	}
+
+	_, err := s.uploader.Upload(ctx, input, uploaderOptsFn)
+	if errIsNoSuchUpload(err) && s.noSuchUploadRetryCount > 0 {
+		return s.retryOnNoSuchUpload(ctx, to, input, err, uploaderOptsFn)
+	}
+	return err
+}
+
+// retryOnNoSuchUpload re-attempts the upload up to noSuchUploadRetryCount
+// times, treating success as "either Upload returned nil OR a Stat shows the
+// object already exists with the metadata-tagged retry ID we generated"
+// (covers the race where a previous attempt did succeed despite the error).
+func (s *S3v2) retryOnNoSuchUpload(
+	ctx context.Context,
+	to *url.URL,
+	input *s3v2.PutObjectInput,
+	err error,
+	uploaderOpts ...func(*manager.Uploader),
+) error {
+	expectedRetryID := input.Metadata[metadataKeyRetryID]
+
+	attempts := 0
+	for ; errIsNoSuchUpload(err) && attempts < s.noSuchUploadRetryCount; attempts++ {
+		obj, sErr := s.Stat(ctx, to)
+		if sErr == nil && obj.retryID == expectedRetryID {
+			err = nil
+			break
+		}
+
+		log.Debug(log.DebugMessage{
+			Err: fmt.Sprintf("Retrying to upload %v upon error: %q", to, err.Error()),
+		})
+
+		_, err = s.uploader.Upload(ctx, input, uploaderOpts...)
+	}
+
+	if errIsNoSuchUpload(err) && s.noSuchUploadRetryCount > 0 {
+		err = fmt.Errorf("RetryOnNoSuchUpload: %d attempts to retry resulted in NoSuchUpload: %w",
+			attempts, err)
+	}
+	return err
 }
 
 // MultiDelete asynchronously removes objects from the input channel,
