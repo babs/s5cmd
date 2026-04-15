@@ -143,6 +143,14 @@ func (cc *clientCache) newClient(ctx context.Context, opts Options) (*s3v2.Clien
 		func(o *s3v2.Options) {
 			o.UsePathStyle = usePathStyle
 			o.UseAccelerate = useAccelerate
+			// v2 added response checksum validation in 2024 (default
+			// WhenSupported) and emits a "WARN Response has no
+			// supported checksum" line for every response that lacks
+			// one. gofakes3 / MinIO / many S3-compat backends do not
+			// emit checksums, which would flood s5cmd's stderr.
+			// Switch to WhenRequired so the SDK only validates when
+			// the request opted in via ChecksumMode.
+			o.ResponseChecksumValidation = awsv2.ResponseChecksumValidationWhenRequired
 		},
 	}
 	if endpointURL != sentinelURL {
