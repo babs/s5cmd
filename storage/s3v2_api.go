@@ -1,8 +1,8 @@
 package storage
 
-// S3v2 mirrors S3 but talks to S3 via aws-sdk-go-v2. Methods are ported from
+// S3 mirrors S3 but talks to S3 via aws-sdk-go-v2. Methods are ported from
 // s3.go incrementally; once parity is reached, NewRemoteClient is switched
-// to return *S3v2 and the v1 implementation is removed.
+// to return *S3 and the v1 implementation is removed.
 
 import (
 	"context"
@@ -26,7 +26,7 @@ import (
 	"github.com/peak/s5cmd/v2/storage/url"
 )
 
-type S3v2 struct {
+type S3 struct {
 	api                    *s3v2.Client
 	uploader               *manager.Uploader
 	downloader             *manager.Downloader
@@ -37,9 +37,9 @@ type S3v2 struct {
 	requestPayer           string
 }
 
-// Compile-time assertion that *S3v2 satisfies the Storage interface, so any
+// Compile-time assertion that *S3 satisfies the Storage interface, so any
 // missing port surfaces as a build error rather than a runtime nil-method.
-var _ Storage = (*S3v2)(nil)
+var _ Storage = (*S3)(nil)
 
 // generateRetryIDStr returns a fresh retry ID as a string. v2 stores object
 // metadata as map[string]string (no pointers), so this differs from the v1
@@ -57,14 +57,14 @@ func generateRetryIDStr() string {
 // (matches v1 setSessionRegion behavior). The resolved region is then folded
 // into opts before constructing the cached client, so cache lookups for the
 // same bucket reuse the same regional client.
-func newS3StorageV2(ctx context.Context, opts Options) (*S3v2, error) {
+func newS3Storage(ctx context.Context, opts Options) (*S3, error) {
 	endpointURL, err := parseEndpoint(opts.Endpoint)
 	if err != nil {
 		return nil, err
 	}
 
 	if opts.region == "" && opts.bucket != "" {
-		region, rerr := resolveBucketRegionV2(ctx, opts)
+		region, rerr := resolveBucketRegion(ctx, opts)
 		if rerr != nil {
 			// Don't deny the request: surface to logs and let the actual
 			// operation report the underlying error in context (matches v1).
@@ -76,12 +76,12 @@ func newS3StorageV2(ctx context.Context, opts Options) (*S3v2, error) {
 		}
 	}
 
-	client, err := globalClientCacheV2.newClient(ctx, opts)
+	client, err := globalClientCache.newClient(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	return &S3v2{
+	return &S3{
 		api:                    client,
 		uploader:               manager.NewUploader(client),
 		downloader:             manager.NewDownloader(client),
@@ -93,15 +93,15 @@ func newS3StorageV2(ctx context.Context, opts Options) (*S3v2, error) {
 	}, nil
 }
 
-// resolveBucketRegionV2 discovers the region of opts.bucket using a
+// resolveBucketRegion discovers the region of opts.bucket using a
 // throwaway us-east-1 client that bypasses the per-Options cache (the cache
 // would otherwise pin the client to the wrong region).
-func resolveBucketRegionV2(ctx context.Context, opts Options) (string, error) {
+func resolveBucketRegion(ctx context.Context, opts Options) (string, error) {
 	probe := opts
 	probe.region = "us-east-1"
 	probe.bucket = "" // skip the recursion guard
 
-	client, err := globalClientCacheV2.newClient(ctx, probe)
+	client, err := globalClientCache.newClient(ctx, probe)
 	if err != nil {
 		return "", err
 	}
@@ -123,7 +123,7 @@ func resolveBucketRegionV2(ctx context.Context, opts Options) (string, error) {
 	return region, nil
 }
 
-func (s *S3v2) requestPayerEnum() s3types.RequestPayer {
+func (s *S3) requestPayerEnum() s3types.RequestPayer {
 	if s.requestPayer == "" {
 		return ""
 	}
@@ -148,7 +148,7 @@ func errIsNotFound(err error) bool {
 }
 
 // Stat retrieves metadata from S3 object without returning the object itself.
-func (s *S3v2) Stat(ctx context.Context, u *url.URL) (*Object, error) {
+func (s *S3) Stat(ctx context.Context, u *url.URL) (*Object, error) {
 	input := &s3v2.HeadObjectInput{
 		Bucket:       awsv2.String(u.Bucket),
 		Key:          awsv2.String(u.Path),
@@ -184,7 +184,7 @@ func (s *S3v2) Stat(ctx context.Context, u *url.URL) (*Object, error) {
 
 // HeadBucket performs a HEAD on the bucket; returns nil if reachable and
 // authorized, otherwise the underlying error.
-func (s *S3v2) HeadBucket(ctx context.Context, u *url.URL) error {
+func (s *S3) HeadBucket(ctx context.Context, u *url.URL) error {
 	_, err := s.api.HeadBucket(ctx, &s3v2.HeadBucketInput{
 		Bucket: awsv2.String(u.Bucket),
 	})
@@ -193,7 +193,7 @@ func (s *S3v2) HeadBucket(ctx context.Context, u *url.URL) error {
 
 // HeadObject returns Object + Metadata for a single key; ErrGivenObjectNotFound
 // when the key is absent.
-func (s *S3v2) HeadObject(ctx context.Context, u *url.URL) (*Object, *Metadata, error) {
+func (s *S3) HeadObject(ctx context.Context, u *url.URL) (*Object, *Metadata, error) {
 	input := &s3v2.HeadObjectInput{
 		Bucket:       awsv2.String(u.Bucket),
 		Key:          awsv2.String(u.Path),
@@ -225,17 +225,25 @@ func (s *S3v2) HeadObject(ctx context.Context, u *url.URL) (*Object, *Metadata, 
 		StorageClass: StorageClass(storageClassStr),
 	}
 
+	// v2 returns nil when no user metadata is present; v1 returned an empty
+	// map. Preserve the empty-map shape so JSON callers see "metadata":{}
+	// instead of "metadata":null.
+	userMeta := output.Metadata
+	if userMeta == nil {
+		userMeta = map[string]string{}
+	}
+
 	metadata := &Metadata{
 		ContentType:      awsv2.ToString(output.ContentType),
 		EncryptionMethod: string(output.ServerSideEncryption),
-		UserDefined:      output.Metadata,
+		UserDefined:      userMeta,
 	}
 	return obj, metadata, nil
 }
 
 // ListBuckets returns the buckets visible to the configured credentials,
 // optionally filtered by name prefix.
-func (s *S3v2) ListBuckets(ctx context.Context, prefix string) ([]Bucket, error) {
+func (s *S3) ListBuckets(ctx context.Context, prefix string) ([]Bucket, error) {
 	out, err := s.api.ListBuckets(ctx, &s3v2.ListBucketsInput{})
 	if err != nil {
 		return nil, err
@@ -255,7 +263,7 @@ func (s *S3v2) ListBuckets(ctx context.Context, prefix string) ([]Bucket, error)
 }
 
 // MakeBucket creates an S3 bucket with the given name.
-func (s *S3v2) MakeBucket(ctx context.Context, name string) error {
+func (s *S3) MakeBucket(ctx context.Context, name string) error {
 	if s.dryRun {
 		return nil
 	}
@@ -267,7 +275,7 @@ func (s *S3v2) MakeBucket(ctx context.Context, name string) error {
 }
 
 // RemoveBucket removes an S3 bucket with the given name.
-func (s *S3v2) RemoveBucket(ctx context.Context, name string) error {
+func (s *S3) RemoveBucket(ctx context.Context, name string) error {
 	if s.dryRun {
 		return nil
 	}
@@ -281,7 +289,7 @@ func (s *S3v2) RemoveBucket(ctx context.Context, name string) error {
 // SetBucketVersioning sets the versioning property of the bucket. The
 // versioningStatus value is the typed BucketVersioningStatus enum
 // ("Enabled" / "Suspended") in v2.
-func (s *S3v2) SetBucketVersioning(ctx context.Context, versioningStatus, bucket string) error {
+func (s *S3) SetBucketVersioning(ctx context.Context, versioningStatus, bucket string) error {
 	if s.dryRun {
 		return nil
 	}
@@ -297,7 +305,7 @@ func (s *S3v2) SetBucketVersioning(ctx context.Context, versioningStatus, bucket
 
 // GetBucketVersioning returns the versioning property of the bucket. Empty
 // string indicates "never enabled" (S3 returns no Status field in that case).
-func (s *S3v2) GetBucketVersioning(ctx context.Context, bucket string) (string, error) {
+func (s *S3) GetBucketVersioning(ctx context.Context, bucket string) (string, error) {
 	out, err := s.api.GetBucketVersioning(ctx, &s3v2.GetBucketVersioningInput{
 		Bucket: awsv2.String(bucket),
 	})
@@ -316,7 +324,7 @@ type chunkV2 struct {
 
 // calculateChunks pulls URLs off ch and emits delete batches sized by S3's
 // 1000-key limit (1 for GCS, which does not support multi-delete).
-func (s *S3v2) calculateChunks(ch <-chan *url.URL) <-chan chunkV2 {
+func (s *S3) calculateChunks(ch <-chan *url.URL) <-chan chunkV2 {
 	chunkch := make(chan chunkV2)
 	chunkSize := deleteObjectsMax
 	if IsGoogleEndpoint(s.endpointURL) {
@@ -350,7 +358,7 @@ func (s *S3v2) calculateChunks(ch <-chan *url.URL) <-chan chunkV2 {
 }
 
 // Delete removes a single object.
-func (s *S3v2) Delete(ctx context.Context, u *url.URL) error {
+func (s *S3) Delete(ctx context.Context, u *url.URL) error {
 	c := chunkV2{
 		Bucket: u.Bucket,
 		Keys:   []s3types.ObjectIdentifier{{Key: awsv2.String(u.Path)}},
@@ -368,7 +376,7 @@ func (s *S3v2) Delete(ctx context.Context, u *url.URL) error {
 
 // doDelete executes a single chunk against DeleteObjects (or per-object
 // DeleteObject for GCS, which does not implement the batch endpoint).
-func (s *S3v2) doDelete(ctx context.Context, c chunkV2, resultch chan *Object) {
+func (s *S3) doDelete(ctx context.Context, c chunkV2, resultch chan *Object) {
 	if s.dryRun {
 		for _, k := range c.Keys {
 			key := fmt.Sprintf("s3://%v/%v", c.Bucket, awsv2.ToString(k.Key))
@@ -428,7 +436,7 @@ func (s *S3v2) doDelete(ctx context.Context, c chunkV2, resultch chan *Object) {
 //
 // followSymlinks is unused for S3 (only meaningful on local FS), kept to
 // satisfy the Storage interface.
-func (s *S3v2) List(ctx context.Context, u *url.URL, _ bool) <-chan *Object {
+func (s *S3) List(ctx context.Context, u *url.URL, _ bool) <-chan *Object {
 	if u.VersionID != "" || u.AllVersions {
 		return s.listObjectVersions(ctx, u)
 	}
@@ -441,7 +449,7 @@ func (s *S3v2) List(ctx context.Context, u *url.URL, _ bool) <-chan *Object {
 // listObjectsV2 paginates ListObjectsV2; matches v1 listObjectsV2 semantics
 // (skip future-dated objects, emit dirs for common prefixes, ErrNoObjectFound
 // when the result set is empty for a non-bucket URL).
-func (s *S3v2) listObjectsV2(ctx context.Context, u *url.URL) <-chan *Object {
+func (s *S3) listObjectsV2(ctx context.Context, u *url.URL) <-chan *Object {
 	in := &s3v2.ListObjectsV2Input{
 		Bucket:       awsv2.String(u.Bucket),
 		Prefix:       awsv2.String(u.Prefix),
@@ -519,7 +527,7 @@ func (s *S3v2) listObjectsV2(ctx context.Context, u *url.URL) <-chan *Object {
 
 // listObjects is the v1 ListObjects fallback for backends that do not
 // implement ListObjectsV2 (notably GCS).
-func (s *S3v2) listObjects(ctx context.Context, u *url.URL) <-chan *Object {
+func (s *S3) listObjects(ctx context.Context, u *url.URL) <-chan *Object {
 	in := &s3v2.ListObjectsInput{
 		Bucket:       awsv2.String(u.Bucket),
 		Prefix:       awsv2.String(u.Prefix),
@@ -613,7 +621,7 @@ func (s *S3v2) listObjects(ctx context.Context, u *url.URL) <-chan *Object {
 // listObjectVersions paginates ListObjectVersions, emitting objects, version
 // markers, and delete markers. Matches v1 semantics including the version-id
 // filter and the future-dated-object skip.
-func (s *S3v2) listObjectVersions(ctx context.Context, u *url.URL) <-chan *Object {
+func (s *S3) listObjectVersions(ctx context.Context, u *url.URL) <-chan *Object {
 	in := &s3v2.ListObjectVersionsInput{
 		Bucket: awsv2.String(u.Bucket),
 		Prefix: awsv2.String(u.Prefix),
@@ -740,7 +748,7 @@ func errIsNoSuchUpload(err error) bool {
 }
 
 // Copy is a server-side copy from one S3 object to another.
-func (s *S3v2) Copy(ctx context.Context, from, to *url.URL, metadata Metadata) error {
+func (s *S3) Copy(ctx context.Context, from, to *url.URL, metadata Metadata) error {
 	if s.dryRun {
 		return nil
 	}
@@ -811,7 +819,7 @@ func (s *S3v2) Copy(ctx context.Context, from, to *url.URL, metadata Metadata) e
 }
 
 // Read fetches the remote object and returns its body as an io.ReadCloser.
-func (s *S3v2) Read(ctx context.Context, src *url.URL) (io.ReadCloser, error) {
+func (s *S3) Read(ctx context.Context, src *url.URL) (io.ReadCloser, error) {
 	input := &s3v2.GetObjectInput{
 		Bucket:       awsv2.String(src.Bucket),
 		Key:          awsv2.String(src.Path),
@@ -829,7 +837,7 @@ func (s *S3v2) Read(ctx context.Context, src *url.URL) (io.ReadCloser, error) {
 }
 
 // Presign produces a time-limited URL for a GetObject request.
-func (s *S3v2) Presign(ctx context.Context, from *url.URL, expire time.Duration) (string, error) {
+func (s *S3) Presign(ctx context.Context, from *url.URL, expire time.Duration) (string, error) {
 	input := &s3v2.GetObjectInput{
 		Bucket:       awsv2.String(from.Bucket),
 		Key:          awsv2.String(from.Path),
@@ -849,7 +857,7 @@ func (s *S3v2) Presign(ctx context.Context, from *url.URL, expire time.Duration)
 // Get is a parallel multipart download via the v2 transfer manager.
 // Concurrency==1 collapses to a single GetObject (partSize ignored), matching
 // v1 behavior.
-func (s *S3v2) Get(
+func (s *S3) Get(
 	ctx context.Context,
 	from *url.URL,
 	to io.WriterAt,
@@ -878,7 +886,7 @@ func (s *S3v2) Get(
 // Put uploads the contents of reader to the destination via the v2 transfer
 // manager. On NoSuchUpload (race with concurrent multipart abort) the
 // configured number of idempotent retries is attempted, mirroring v1.
-func (s *S3v2) Put(
+func (s *S3) Put(
 	ctx context.Context,
 	reader io.Reader,
 	to *url.URL,
@@ -957,7 +965,7 @@ func (s *S3v2) Put(
 // times, treating success as "either Upload returned nil OR a Stat shows the
 // object already exists with the metadata-tagged retry ID we generated"
 // (covers the race where a previous attempt did succeed despite the error).
-func (s *S3v2) retryOnNoSuchUpload(
+func (s *S3) retryOnNoSuchUpload(
 	ctx context.Context,
 	to *url.URL,
 	input *s3v2.PutObjectInput,
@@ -1042,7 +1050,7 @@ func parseOutputSerializationV2(e eventType, delimiter string, reader io.Reader)
 // Select streams S3 Select results into resultCh. Tagged-union event handling
 // in v2: types.SelectObjectContentEventStream is an interface; the records
 // payload arrives as *types.SelectObjectContentEventStreamMemberRecords.
-func (s *S3v2) Select(ctx context.Context, u *url.URL, query *SelectQuery, resultCh chan<- json.RawMessage) error {
+func (s *S3) Select(ctx context.Context, u *url.URL, query *SelectQuery, resultCh chan<- json.RawMessage) error {
 	if s.dryRun {
 		return nil
 	}
@@ -1124,7 +1132,7 @@ func (s *S3v2) Select(ctx context.Context, u *url.URL, query *SelectQuery, resul
 
 // MultiDelete asynchronously removes objects from the input channel,
 // fan-out at most 10 in-flight DeleteObjects requests.
-func (s *S3v2) MultiDelete(ctx context.Context, urlch <-chan *url.URL) <-chan *Object {
+func (s *S3) MultiDelete(ctx context.Context, urlch <-chan *url.URL) <-chan *Object {
 	resultch := make(chan *Object)
 
 	go func() {

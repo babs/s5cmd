@@ -24,13 +24,13 @@ import (
 	"github.com/peak/s5cmd/v2/log"
 )
 
-// clientCacheV2 mirrors SessionCache for the v2 SDK; cached *s3.Client
+// clientCache mirrors SessionCache for the v2 SDK; cached *s3.Client
 // instances are reused per Options to avoid repeated config resolution.
-var globalClientCacheV2 = &clientCacheV2{
+var globalClientCache = &clientCache{
 	clients: map[Options]*s3v2.Client{},
 }
 
-type clientCacheV2 struct {
+type clientCache struct {
 	sync.Mutex
 	clients map[Options]*s3v2.Client
 }
@@ -49,7 +49,7 @@ type clientCacheV2 struct {
 //
 // AWS_SDK_LOAD_CONFIG=0 disables shared config (legacy s5cmd behavior; v2
 // loads shared config by default).
-func (cc *clientCacheV2) newClient(ctx context.Context, opts Options) (*s3v2.Client, error) {
+func (cc *clientCache) newClient(ctx context.Context, opts Options) (*s3v2.Client, error) {
 	cc.Lock()
 	defer cc.Unlock()
 
@@ -162,7 +162,7 @@ func (cc *clientCacheV2) newClient(ctx context.Context, opts Options) (*s3v2.Cli
 	return client, nil
 }
 
-func (cc *clientCacheV2) clear() {
+func (cc *clientCache) clear() {
 	cc.Lock()
 	defer cc.Unlock()
 	cc.clients = map[Options]*s3v2.Client{}

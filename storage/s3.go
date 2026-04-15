@@ -59,7 +59,7 @@ var globalSessionCache = &SessionCache{
 
 // S3 is a storage type which interacts with S3API, DownloaderAPI and
 // UploaderAPI.
-type S3 struct {
+type S3v1 struct {
 	api                    s3iface.S3API
 	downloader             s3manageriface.DownloaderAPI
 	uploader               s3manageriface.UploaderAPI
@@ -70,7 +70,7 @@ type S3 struct {
 	requestPayer           string
 }
 
-func (s *S3) RequestPayer() *string {
+func (s *S3v1) RequestPayer() *string {
 	if s.requestPayer == "" {
 		return nil
 	}
@@ -91,7 +91,7 @@ func parseEndpoint(endpoint string) (urlpkg.URL, error) {
 }
 
 // NewS3Storage creates new S3 session.
-func newS3Storage(ctx context.Context, opts Options) (*S3, error) {
+func newS3StorageV1(ctx context.Context, opts Options) (*S3v1, error) {
 	endpointURL, err := parseEndpoint(opts.Endpoint)
 	if err != nil {
 		return nil, err
@@ -102,7 +102,7 @@ func newS3Storage(ctx context.Context, opts Options) (*S3, error) {
 		return nil, err
 	}
 
-	return &S3{
+	return &S3v1{
 		api:                    s3.New(awsSession),
 		downloader:             s3manager.NewDownloader(awsSession),
 		uploader:               s3manager.NewUploader(awsSession),
@@ -115,7 +115,7 @@ func newS3Storage(ctx context.Context, opts Options) (*S3, error) {
 }
 
 // Stat retrieves metadata from S3 object without returning the object itself.
-func (s *S3) Stat(ctx context.Context, url *url.URL) (*Object, error) {
+func (s *S3v1) Stat(ctx context.Context, url *url.URL) (*Object, error) {
 	input := &s3.HeadObjectInput{
 		Bucket:       aws.String(url.Bucket),
 		Key:          aws.String(url.Path),
@@ -155,7 +155,7 @@ func (s *S3) Stat(ctx context.Context, url *url.URL) (*Object, error) {
 // List is a non-blocking S3 list operation which paginates and filters S3
 // keys. If no object found or an error is encountered during this period,
 // it sends these errors to object channel.
-func (s *S3) List(ctx context.Context, url *url.URL, _ bool) <-chan *Object {
+func (s *S3v1) List(ctx context.Context, url *url.URL, _ bool) <-chan *Object {
 	if url.VersionID != "" || url.AllVersions {
 		return s.listObjectVersions(ctx, url)
 	}
@@ -166,7 +166,7 @@ func (s *S3) List(ctx context.Context, url *url.URL, _ bool) <-chan *Object {
 	return s.listObjectsV2(ctx, url)
 }
 
-func (s *S3) listObjectVersions(ctx context.Context, url *url.URL) <-chan *Object {
+func (s *S3v1) listObjectVersions(ctx context.Context, url *url.URL) <-chan *Object {
 	listInput := s3.ListObjectVersionsInput{
 		Bucket: aws.String(url.Bucket),
 		Prefix: aws.String(url.Prefix),
@@ -295,7 +295,7 @@ func (s *S3) listObjectVersions(ctx context.Context, url *url.URL) <-chan *Objec
 	return objCh
 }
 
-func (s *S3) listObjectsV2(ctx context.Context, url *url.URL) <-chan *Object {
+func (s *S3v1) listObjectsV2(ctx context.Context, url *url.URL) <-chan *Object {
 	listInput := s3.ListObjectsV2Input{
 		Bucket:       aws.String(url.Bucket),
 		Prefix:       aws.String(url.Prefix),
@@ -386,7 +386,7 @@ func (s *S3) listObjectsV2(ctx context.Context, url *url.URL) <-chan *Object {
 
 // listObjects is used for cloud services that does not support S3
 // ListObjectsV2 API. I'm looking at you GCS.
-func (s *S3) listObjects(ctx context.Context, url *url.URL) <-chan *Object {
+func (s *S3v1) listObjects(ctx context.Context, url *url.URL) <-chan *Object {
 	listInput := s3.ListObjectsInput{
 		Bucket:       aws.String(url.Bucket),
 		Prefix:       aws.String(url.Prefix),
@@ -477,7 +477,7 @@ func (s *S3) listObjects(ctx context.Context, url *url.URL) <-chan *Object {
 
 // Copy is a single-object copy operation which copies objects to S3
 // destination from another S3 source.
-func (s *S3) Copy(ctx context.Context, from, to *url.URL, metadata Metadata) error {
+func (s *S3v1) Copy(ctx context.Context, from, to *url.URL, metadata Metadata) error {
 	if s.dryRun {
 		return nil
 	}
@@ -569,7 +569,7 @@ func (s *S3) Copy(ctx context.Context, from, to *url.URL, metadata Metadata) err
 }
 
 // Read fetches the remote object and returns its contents as an io.ReadCloser.
-func (s *S3) Read(ctx context.Context, src *url.URL) (io.ReadCloser, error) {
+func (s *S3v1) Read(ctx context.Context, src *url.URL) (io.ReadCloser, error) {
 	input := &s3.GetObjectInput{
 		Bucket:       aws.String(src.Bucket),
 		Key:          aws.String(src.Path),
@@ -586,7 +586,7 @@ func (s *S3) Read(ctx context.Context, src *url.URL) (io.ReadCloser, error) {
 	return resp.Body, nil
 }
 
-func (s *S3) Presign(ctx context.Context, from *url.URL, expire time.Duration) (string, error) {
+func (s *S3v1) Presign(ctx context.Context, from *url.URL, expire time.Duration) (string, error) {
 	input := &s3.GetObjectInput{
 		Bucket:       aws.String(from.Bucket),
 		Key:          aws.String(from.Path),
@@ -601,7 +601,7 @@ func (s *S3) Presign(ctx context.Context, from *url.URL, expire time.Duration) (
 // Get is a multipart download operation which downloads S3 objects into any
 // destination that implements io.WriterAt interface.
 // Makes a single 'GetObject' call if 'concurrency' is 1 and ignores 'partSize'.
-func (s *S3) Get(
+func (s *S3v1) Get(
 	ctx context.Context,
 	from *url.URL,
 	to io.WriterAt,
@@ -702,7 +702,7 @@ func parseOutputSerialization(e eventType, delimiter string, reader io.Reader) (
 	return s, decoder, nil
 }
 
-func (s *S3) Select(ctx context.Context, url *url.URL, query *SelectQuery, resultCh chan<- json.RawMessage) error {
+func (s *S3v1) Select(ctx context.Context, url *url.URL, query *SelectQuery, resultCh chan<- json.RawMessage) error {
 	if s.dryRun {
 		return nil
 	}
@@ -791,7 +791,7 @@ func (s *S3) Select(ctx context.Context, url *url.URL, query *SelectQuery, resul
 
 // Put is a multipart upload operation to upload resources, which implements
 // io.Reader interface, into S3 destination.
-func (s *S3) Put(
+func (s *S3v1) Put(
 	ctx context.Context,
 	reader io.Reader,
 	to *url.URL,
@@ -886,7 +886,7 @@ func (s *S3) Put(
 	return err
 }
 
-func (s *S3) retryOnNoSuchUpload(ctx aws.Context, to *url.URL, input *s3manager.UploadInput,
+func (s *S3v1) retryOnNoSuchUpload(ctx aws.Context, to *url.URL, input *s3manager.UploadInput,
 	err error, uploaderOpts ...func(*s3manager.Uploader),
 ) error {
 	var expectedRetryID string
@@ -928,7 +928,7 @@ type chunk struct {
 
 // calculateChunks calculates chunks for given URL channel and returns
 // read-only chunk channel.
-func (s *S3) calculateChunks(ch <-chan *url.URL) <-chan chunk {
+func (s *S3v1) calculateChunks(ch <-chan *url.URL) <-chan chunk {
 	chunkch := make(chan chunk)
 
 	chunkSize := deleteObjectsMax
@@ -976,7 +976,7 @@ func (s *S3) calculateChunks(ch <-chan *url.URL) <-chan chunk {
 }
 
 // Delete is a single object delete operation.
-func (s *S3) Delete(ctx context.Context, url *url.URL) error {
+func (s *S3v1) Delete(ctx context.Context, url *url.URL) error {
 	chunk := chunk{
 		Bucket: url.Bucket,
 		Keys: []*s3.ObjectIdentifier{
@@ -994,7 +994,7 @@ func (s *S3) Delete(ctx context.Context, url *url.URL) error {
 
 // doDelete deletes the given keys given by chunk. Results are piggybacked via
 // the Object container.
-func (s *S3) doDelete(ctx context.Context, chunk chunk, resultch chan *Object) {
+func (s *S3v1) doDelete(ctx context.Context, chunk chunk, resultch chan *Object) {
 	if s.dryRun {
 		for _, k := range chunk.Keys {
 			key := fmt.Sprintf("s3://%v/%v", chunk.Bucket, aws.StringValue(k.Key))
@@ -1059,7 +1059,7 @@ func (s *S3) doDelete(ctx context.Context, chunk chunk, resultch chan *Object) {
 // chunks in parallel. Each chunk may have at most 1000 objects since DeleteObjects
 // API has a limitation.
 // See: https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html.
-func (s *S3) MultiDelete(ctx context.Context, urlch <-chan *url.URL) <-chan *Object {
+func (s *S3v1) MultiDelete(ctx context.Context, urlch <-chan *url.URL) <-chan *Object {
 	resultch := make(chan *Object)
 
 	go func() {
@@ -1091,7 +1091,7 @@ func (s *S3) MultiDelete(ctx context.Context, urlch <-chan *url.URL) <-chan *Obj
 
 // ListBuckets is a blocking list-operation which gets bucket list and returns
 // the buckets that match with given prefix.
-func (s *S3) ListBuckets(ctx context.Context, prefix string) ([]Bucket, error) {
+func (s *S3v1) ListBuckets(ctx context.Context, prefix string) ([]Bucket, error) {
 	o, err := s.api.ListBucketsWithContext(ctx, &s3.ListBucketsInput{})
 	if err != nil {
 		return nil, err
@@ -1111,7 +1111,7 @@ func (s *S3) ListBuckets(ctx context.Context, prefix string) ([]Bucket, error) {
 }
 
 // MakeBucket creates an S3 bucket with the given name.
-func (s *S3) MakeBucket(ctx context.Context, name string) error {
+func (s *S3v1) MakeBucket(ctx context.Context, name string) error {
 	if s.dryRun {
 		return nil
 	}
@@ -1123,7 +1123,7 @@ func (s *S3) MakeBucket(ctx context.Context, name string) error {
 }
 
 // RemoveBucket removes an S3 bucket with the given name.
-func (s *S3) RemoveBucket(ctx context.Context, name string) error {
+func (s *S3v1) RemoveBucket(ctx context.Context, name string) error {
 	if s.dryRun {
 		return nil
 	}
@@ -1135,7 +1135,7 @@ func (s *S3) RemoveBucket(ctx context.Context, name string) error {
 }
 
 // SetBucketVersioning sets the versioning property of the bucket
-func (s *S3) SetBucketVersioning(ctx context.Context, versioningStatus, bucket string) error {
+func (s *S3v1) SetBucketVersioning(ctx context.Context, versioningStatus, bucket string) error {
 	if s.dryRun {
 		return nil
 	}
@@ -1150,7 +1150,7 @@ func (s *S3) SetBucketVersioning(ctx context.Context, versioningStatus, bucket s
 }
 
 // GetBucketVersioning returnsversioning property of the bucket
-func (s *S3) GetBucketVersioning(ctx context.Context, bucket string) (string, error) {
+func (s *S3v1) GetBucketVersioning(ctx context.Context, bucket string) (string, error) {
 	output, err := s.api.GetBucketVersioningWithContext(ctx, &s3.GetBucketVersioningInput{
 		Bucket: aws.String(bucket),
 	})
@@ -1161,14 +1161,14 @@ func (s *S3) GetBucketVersioning(ctx context.Context, bucket string) (string, er
 	return *output.Status, nil
 }
 
-func (s *S3) HeadBucket(ctx context.Context, url *url.URL) error {
+func (s *S3v1) HeadBucket(ctx context.Context, url *url.URL) error {
 	_, err := s.api.HeadBucketWithContext(ctx, &s3.HeadBucketInput{
 		Bucket: aws.String(url.Bucket),
 	})
 	return err
 }
 
-func (s *S3) HeadObject(ctx context.Context, url *url.URL) (*Object, *Metadata, error) {
+func (s *S3v1) HeadObject(ctx context.Context, url *url.URL) (*Object, *Metadata, error) {
 	input := &s3.HeadObjectInput{
 		Bucket:       aws.String(url.Bucket),
 		Key:          aws.String(url.Path),

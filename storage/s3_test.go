@@ -34,7 +34,7 @@ import (
 )
 
 func TestS3ImplementsStorageInterface(t *testing.T) {
-	var i interface{} = new(S3)
+	var i interface{} = new(S3v1)
 	if _, ok := i.(Storage); !ok {
 		t.Errorf("expected %t to implement Storage interface", i)
 	}
@@ -220,7 +220,7 @@ func TestS3ListURL(t *testing.T) {
 	}
 
 	mockAPI := s3.New(unit.Session)
-	mockS3 := &S3{
+	mockS3 := &S3v1{
 		api: mockAPI,
 	}
 
@@ -296,7 +296,7 @@ func TestS3ListError(t *testing.T) {
 	}
 
 	mockAPI := s3.New(unit.Session)
-	mockS3 := &S3{
+	mockS3 := &S3v1{
 		api: mockAPI,
 	}
 	mockErr := fmt.Errorf("mock error")
@@ -322,7 +322,7 @@ func TestS3ListNoItemFound(t *testing.T) {
 	}
 
 	mockAPI := s3.New(unit.Session)
-	mockS3 := &S3{
+	mockS3 := &S3v1{
 		api: mockAPI,
 	}
 
@@ -358,7 +358,7 @@ func TestS3ListContextCancelled(t *testing.T) {
 	}
 
 	mockAPI := s3.New(unit.Session)
-	mockS3 := &S3{
+	mockS3 := &S3v1{
 		api: mockAPI,
 	}
 
@@ -540,7 +540,7 @@ func TestS3Retry(t *testing.T) {
 			sess.Config.Retryer = newCustomRetryer(expectedRetry)
 
 			mockAPI := s3.New(sess)
-			mockS3 := &S3{
+			mockS3 := &S3v1{
 				api: mockAPI,
 			}
 
@@ -606,7 +606,7 @@ func TestS3RetryOnNoSuchUpload(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			mockAPI := s3.New(unit.Session)
-			mockS3 := &S3{
+			mockS3 := &S3v1{
 				api: mockAPI,
 				uploader: &s3manager.Uploader{
 					S3:                mockAPI,
@@ -737,7 +737,7 @@ func TestS3CopyEncryptionRequest(t *testing.T) {
 				}
 			})
 
-			mockS3 := &S3{
+			mockS3 := &S3v1{
 				api: mockAPI,
 			}
 
@@ -830,7 +830,7 @@ func TestS3PutEncryptionRequest(t *testing.T) {
 				assert.Equal(t, aclVal, tc.expectedACL)
 			})
 
-			mockS3 := &S3{
+			mockS3 := &S3v1{
 				uploader: s3manager.NewUploaderWithClient(mockAPI),
 			}
 
@@ -911,7 +911,7 @@ func TestS3listObjectsV2(t *testing.T) {
 		}
 	})
 
-	mockS3 := &S3{
+	mockS3 := &S3v1{
 		api: mockAPI,
 	}
 
@@ -1159,7 +1159,7 @@ func TestS3ListObjectsAPIVersions(t *testing.T) {
 	}
 
 	mockAPI := s3.New(unit.Session)
-	mockS3 := &S3{api: mockAPI}
+	mockS3 := &S3v1{api: mockAPI}
 
 	mockAPI.Handlers.Send.Clear()
 	mockAPI.Handlers.Unmarshal.Clear()
@@ -1275,7 +1275,7 @@ func TestS3HeadObject(t *testing.T) {
 			}
 
 			mockAPI := s3.New(unit.Session)
-			mockS3 := &S3{api: mockAPI}
+			mockS3 := &S3v1{api: mockAPI}
 
 			mockAPI.Handlers.Send.Clear()
 			mockAPI.Handlers.Unmarshal.Clear()
