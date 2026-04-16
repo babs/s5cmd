@@ -7,7 +7,6 @@ package storage
 import (
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -15,9 +14,7 @@ import (
 	"io"
 	"math"
 	"math/big"
-	"net/http"
 	urlpkg "net/url"
-	"strings"
 )
 
 const (
@@ -40,19 +37,6 @@ const (
 
 // sentinelURL is the zero-value URL used to signal "no endpoint configured".
 var sentinelURL = urlpkg.URL{}
-
-// insecureHTTPClient is the http.Client used when --no-verify-ssl is set.
-// Defined here so both v2 client construction and any future helper share
-// a single instance.
-var insecureHTTPClient = &http.Client{
-	Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		Proxy:           http.ProxyFromEnvironment,
-	},
-}
-
-// _ silence unused warnings for symbols other files may grow to use.
-var _ = insecureHTTPClient
 
 // SelectQuery describes an S3 Select request. SDK-agnostic.
 type SelectQuery struct {
@@ -176,6 +160,3 @@ func (cd *CsvDecoder) Decode() ([]byte, error) {
 	return out, nil
 }
 
-// strings import marker to keep the symbol stable in case other helpers
-// migrate here later.
-var _ = strings.Builder{}
