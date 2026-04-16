@@ -96,14 +96,12 @@ func IsCancelationError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// generateRetryID returns a fresh idempotent-upload token as *string. v1
-// stored object metadata as map[string]*string so the pointer flavor was
-// natural; v2 keeps the function for compatibility with helpers that still
-// produce the pointer (generateRetryIDStr derives a string from this).
-func generateRetryID() *string {
+// generateRetryID returns a fresh idempotent-upload token. v2's
+// PutObjectInput.Metadata is map[string]string so the value is consumed
+// directly; no pointer flavor needed.
+func generateRetryID() string {
 	num, _ := rand.Int(rand.Reader, big.NewInt(math.MaxInt64))
-	s := num.String()
-	return &s
+	return num.String()
 }
 
 // EventStreamDecoder decodes one record at a time from an S3 Select

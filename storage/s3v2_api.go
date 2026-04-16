@@ -41,12 +41,6 @@ type S3 struct {
 // missing port surfaces as a build error rather than a runtime nil-method.
 var _ Storage = (*S3)(nil)
 
-// generateRetryIDStr returns a fresh retry ID as a string. v2 stores object
-// metadata as map[string]string (no pointers), so this differs from the v1
-// generateRetryID helper which returned *string.
-func generateRetryIDStr() string {
-	return awsv2.ToString(generateRetryID())
-}
 
 // newS3StorageV2 builds a v2-backed S3 storage handle. Mirrors newS3Storage
 // and is used during incremental migration; once all methods are ported and
@@ -360,17 +354,17 @@ func (s *S3) GetBucketVersioning(ctx context.Context, bucket string) (string, er
 	return string(out.Status), nil
 }
 
-// chunkV2 is the v2 equivalent of chunk{} -- holds a batch of object IDs to
+// chunk is the v2 equivalent of chunk{} -- holds a batch of object IDs to
 // delete. ObjectIdentifier in v2 is a value type rather than a pointer.
-type chunkV2 struct {
+type chunk struct {
 	Bucket string
 	Keys   []s3types.ObjectIdentifier
 }
 
 // calculateChunks pulls URLs off ch and emits delete batches sized by S3's
 // 1000-key limit (1 for GCS, which does not support multi-delete).
-func (s *S3) calculateChunks(ch <-chan *url.URL) <-chan chunkV2 {
-	chunkch := make(chan chunkV2)
+func (s *S3) calculateChunks(ch <-chan *url.URL) <-chan chunk {
+	chunkch := make(chan chunk)
 	chunkSize := deleteObjectsMax
 	if IsGoogleEndpoint(s.endpointURL) {
 		chunkSize = 1
@@ -390,12 +384,12 @@ func (s *S3) calculateChunks(ch <-chan *url.URL) <-chan chunkV2 {
 			keys = append(keys, objid)
 
 			if len(keys) == chunkSize {
-				chunkch <- chunkV2{Bucket: bucket, Keys: keys}
+				chunkch <- chunk{Bucket: bucket, Keys: keys}
 				keys = nil
 			}
 		}
 		if len(keys) > 0 {
-			chunkch <- chunkV2{Bucket: bucket, Keys: keys}
+			chunkch <- chunk{Bucket: bucket, Keys: keys}
 		}
 	}()
 
@@ -404,7 +398,7 @@ func (s *S3) calculateChunks(ch <-chan *url.URL) <-chan chunkV2 {
 
 // Delete removes a single object.
 func (s *S3) Delete(ctx context.Context, u *url.URL) error {
-	c := chunkV2{
+	c := chunk{
 		Bucket: u.Bucket,
 		Keys:   []s3types.ObjectIdentifier{{Key: awsv2.String(u.Path)}},
 	}
@@ -421,7 +415,7 @@ func (s *S3) Delete(ctx context.Context, u *url.URL) error {
 
 // doDelete executes a single chunk against DeleteObjects (or per-object
 // DeleteObject for GCS, which does not implement the batch endpoint).
-func (s *S3) doDelete(ctx context.Context, c chunkV2, resultch chan *Object) {
+func (s *S3) doDelete(ctx context.Context, c chunk, resultch chan *Object) {
 	if s.dryRun {
 		for _, k := range c.Keys {
 			key := fmt.Sprintf("s3://%v/%v", c.Bucket, awsv2.ToString(k.Key))
@@ -856,7 +850,7 @@ func (s *S3) Copy(ctx context.Context, from, to *url.URL, metadata Metadata) err
 		if input.Metadata == nil {
 			input.Metadata = make(map[string]string)
 		}
-		input.Metadata[metadataKeyRetryID] = generateRetryIDStr()
+		input.Metadata[metadataKeyRetryID] = generateRetryID()
 	}
 
 	_, err := s.api.CopyObject(ctx, input)
@@ -987,7 +981,7 @@ func (s *S3) Put(
 		input.ContentDisposition = awsv2.String(metadata.ContentDisposition)
 	}
 	if s.noSuchUploadRetryCount > 0 {
-		input.Metadata[metadataKeyRetryID] = generateRetryIDStr()
+		input.Metadata[metadataKeyRetryID] = generateRetryID()
 	}
 	if len(metadata.UserDefined) != 0 {
 		for k, v := range metadata.UserDefined {
@@ -1042,7 +1036,7 @@ func (s *S3) retryOnNoSuchUpload(
 	return err
 }
 
-// parseInputSerializationV2 builds the v2 InputSerialization for the given
+// parseInputSerialization builds the v2 InputSerialization for the given
 // query shape. v2 enums replace the v1 string fields:
 //
 //	JSONInput.Type           -> types.JSONType
@@ -1050,7 +1044,7 @@ func (s *S3) retryOnNoSuchUpload(
 //	InputSerialization.CompressionType -> types.CompressionType
 //
 // CSVInput.FieldDelimiter remains *string (no enum).
-func parseInputSerializationV2(e eventType, compression, delimiter, headerInfo string) (*s3types.InputSerialization, error) {
+func parseInputSerialization(e eventType, compression, delimiter, headerInfo string) (*s3types.InputSerialization, error) {
 	switch e {
 	case jsonType:
 		in := &s3types.InputSerialization{
@@ -1080,7 +1074,7 @@ func parseInputSerializationV2(e eventType, compression, delimiter, headerInfo s
 	}
 }
 
-func parseOutputSerializationV2(e eventType, delimiter string, reader io.Reader) (*s3types.OutputSerialization, EventStreamDecoder, error) {
+func parseOutputSerialization(e eventType, delimiter string, reader io.Reader) (*s3types.OutputSerialization, EventStreamDecoder, error) {
 	switch e {
 	case jsonType:
 		return &s3types.OutputSerialization{JSON: &s3types.JSONOutput{}}, NewJSONDecoder(reader), nil
@@ -1103,7 +1097,7 @@ func (s *S3) Select(ctx context.Context, u *url.URL, query *SelectQuery, resultC
 
 	reader, writer := io.Pipe()
 
-	inputFormat, err := parseInputSerializationV2(
+	inputFormat, err := parseInputSerialization(
 		eventType(query.InputFormat),
 		query.CompressionType,
 		query.InputContentStructure,
@@ -1119,7 +1113,7 @@ func (s *S3) Select(ctx context.Context, u *url.URL, query *SelectQuery, resultC
 		query.InputContentStructure = ","
 	}
 
-	outputFormat, decoder, err := parseOutputSerializationV2(
+	outputFormat, decoder, err := parseOutputSerialization(
 		eventType(query.OutputFormat),
 		query.InputContentStructure,
 		reader,
