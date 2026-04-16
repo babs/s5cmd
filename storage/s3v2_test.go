@@ -7,11 +7,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	s3v2 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/logging"
 
 	"github.com/peak/s5cmd/v2/log"
 	"github.com/peak/s5cmd/v2/storage/url"
@@ -40,9 +43,25 @@ func newTestS3(t *testing.T, srv *httptest.Server) *S3 {
 	return s
 }
 
+// TestMain sets up a single package-wide log.Logger. The log package uses
+// a package-level outputCh channel that cannot be re-opened after Close,
+// so per-test Init/Close pairs would panic on the second test ("send on
+// closed channel"). Initialize once at "error" level (silent for normal
+// tests) and never tear down -- the test binary process exits anyway.
+func TestMain(m *testing.M) {
+	log.Init("error", false)
+	os.Exit(m.Run())
+}
+
 // resetClientCache swaps in a fresh client cache for the duration of the
 // test so concurrent tests don't share cached *s3.Client instances pinned
 // to dead httptest servers.
+//
+// Tests in this file MUST NOT call t.Parallel(): this helper mutates the
+// package-level globalClientCache without synchronization, and Cleanup
+// restores the previous value when the test ends. With t.Parallel() the
+// swap and the restore would race other tests' swaps and the cache would
+// be in an undefined state.
 func resetClientCache(t *testing.T) {
 	t.Helper()
 	prev := globalClientCache
@@ -407,7 +426,9 @@ func TestPresign_GeneratesURL(t *testing.T) {
 // of contents must both reach the channel. Catches a regression where the
 // paginator loop exits prematurely or the second page is dropped.
 func TestList_PaginatedV2(t *testing.T) {
-	page := 0
+	// atomic: the SDK serializes paginator requests today, but a future
+	// SDK change firing concurrent page reads would race a plain int.
+	var page atomic.Int32
 	page1 := `<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult>
   <IsTruncated>true</IsTruncated>
@@ -423,8 +444,8 @@ func TestList_PaginatedV2(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
 		w.WriteHeader(http.StatusOK)
-		page++
-		if page == 1 {
+		n := page.Add(1)
+		if n == 1 {
 			_, _ = w.Write([]byte(page1))
 		} else {
 			_, _ = w.Write([]byte(page2))
@@ -445,8 +466,246 @@ func TestList_PaginatedV2(t *testing.T) {
 	if len(got) != 3 {
 		t.Errorf("got %d objects, want 3 (across two pages): %v", len(got), got)
 	}
-	if page < 2 {
-		t.Errorf("paginator made only %d HTTP requests, want 2", page)
+	if got := page.Load(); got < 2 {
+		t.Errorf("paginator made only %d HTTP requests, want 2", got)
+	}
+}
+
+// TestList_PaginatedV1NextMarkerFallback covers the GCS-fallback path
+// (--use-list-objects-v1). v2 has no NewListObjectsPaginator for the v1
+// API, so the storage layer iterates manually with two NextMarker
+// strategies: the response's <NextMarker> when delimiter is set, otherwise
+// the last <Contents><Key>. Without delimiter, this test feeds two pages
+// and asserts the second page is fetched -- a regression that drops the
+// last-key fallback would make pagination silently truncate after page 1.
+func TestList_PaginatedV1NextMarkerFallback(t *testing.T) {
+	var page atomic.Int32
+	page1 := `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <IsTruncated>true</IsTruncated>
+  <Contents><Key>a/1</Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>"e1"</ETag><Size>10</Size><StorageClass>STANDARD</StorageClass></Contents>
+  <Contents><Key>a/2</Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>"e2"</ETag><Size>20</Size><StorageClass>STANDARD</StorageClass></Contents>
+</ListBucketResult>`
+	page2 := `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>a/3</Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>"e3"</ETag><Size>30</Size><StorageClass>STANDARD</StorageClass></Contents>
+</ListBucketResult>`
+	var lastQuery atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastQuery.Store(r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		if page.Add(1) == 1 {
+			_, _ = w.Write([]byte(page1))
+		} else {
+			_, _ = w.Write([]byte(page2))
+		}
+	}))
+	defer srv.Close()
+
+	resetClientCache(t)
+	s, err := newS3Storage(context.Background(), Options{
+		Endpoint:         srv.URL,
+		NoSignRequest:    true,
+		region:           "us-east-1",
+		UseListObjectsV1: true,
+		LogLevel:         log.LevelInfo,
+	})
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+	u, _ := url.New("s3://my-bucket/a/*")
+
+	var got []string
+	for obj := range s.List(context.Background(), u, false) {
+		if obj.Err != nil {
+			t.Fatalf("list error: %v", obj.Err)
+		}
+		got = append(got, obj.URL.Path)
+	}
+	if len(got) != 3 {
+		t.Errorf("got %d objects, want 3 (across two pages): %v", len(got), got)
+	}
+	if got := page.Load(); got < 2 {
+		t.Errorf("paginator made only %d HTTP requests, want 2 (NextMarker fallback failed)", got)
+	}
+	// The second request must carry a marker derived from the last key
+	// of the first page (a/2), since no <NextMarker> was provided.
+	if q, _ := lastQuery.Load().(string); !strings.Contains(q, "marker=a%2F2") && !strings.Contains(q, "marker=a/2") {
+		t.Errorf("second request query %q missing expected marker=a/2", q)
+	}
+}
+
+// TestList_PaginatedV1WithExplicitNextMarker covers the other branch:
+// when S3 returns <NextMarker> (which it does only when delimiter is set),
+// the storage layer uses it directly instead of the last-key fallback.
+func TestList_PaginatedV1WithExplicitNextMarker(t *testing.T) {
+	var page atomic.Int32
+	page1 := `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <IsTruncated>true</IsTruncated>
+  <NextMarker>explicit-marker</NextMarker>
+  <Contents><Key>a</Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>"e"</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents>
+</ListBucketResult>`
+	page2 := `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>b</Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>"e"</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents>
+</ListBucketResult>`
+	var lastQuery atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastQuery.Store(r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		if page.Add(1) == 1 {
+			_, _ = w.Write([]byte(page1))
+		} else {
+			_, _ = w.Write([]byte(page2))
+		}
+	}))
+	defer srv.Close()
+
+	resetClientCache(t)
+	s, err := newS3Storage(context.Background(), Options{
+		Endpoint:         srv.URL,
+		NoSignRequest:    true,
+		region:           "us-east-1",
+		UseListObjectsV1: true,
+		LogLevel:         log.LevelInfo,
+	})
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+	u, _ := url.New("s3://my-bucket/")
+
+	count := 0
+	for obj := range s.List(context.Background(), u, false) {
+		if obj.Err != nil {
+			t.Fatalf("list error: %v", obj.Err)
+		}
+		count++
+	}
+	if count != 2 {
+		t.Errorf("got %d objects, want 2", count)
+	}
+	if q, _ := lastQuery.Load().(string); !strings.Contains(q, "marker=explicit-marker") {
+		t.Errorf("second request query %q missing explicit NextMarker", q)
+	}
+}
+
+// TestListObjectVersions covers the bucket-version listing path. Single
+// XML response with one Version, one DeleteMarker, and one CommonPrefix
+// exercises the three emit branches plus the version-id filter and
+// future-mod-time skip (latter implicitly: mod times are in the past).
+func TestListObjectVersions(t *testing.T) {
+	body := `<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult>
+  <IsTruncated>false</IsTruncated>
+  <CommonPrefixes><Prefix>dir/</Prefix></CommonPrefixes>
+  <Version>
+    <Key>key1</Key>
+    <VersionId>v1</VersionId>
+    <LastModified>2024-01-01T00:00:00Z</LastModified>
+    <ETag>"e1"</ETag>
+    <Size>10</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Version>
+  <DeleteMarker>
+    <Key>key1</Key>
+    <VersionId>vDel</VersionId>
+    <LastModified>2024-01-02T00:00:00Z</LastModified>
+  </DeleteMarker>
+</ListVersionsResult>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	u, err := url.New("s3://my-bucket/", url.WithAllVersions(true))
+	if err != nil {
+		t.Fatalf("url.New: %v", err)
+	}
+
+	type seen struct {
+		path, vid string
+		isDir     bool
+		size      int64
+	}
+	var got []seen
+	for obj := range s.List(context.Background(), u, false) {
+		if obj.Err != nil {
+			t.Fatalf("list error: %v", obj.Err)
+		}
+		got = append(got, seen{
+			path:  obj.URL.Path,
+			vid:   obj.URL.VersionID,
+			isDir: obj.Type.IsDir(),
+			size:  obj.Size,
+		})
+	}
+
+	// Expect: one CommonPrefix dir, one Version, one DeleteMarker.
+	if len(got) != 3 {
+		t.Fatalf("got %d objects, want 3 (1 dir + 1 version + 1 delete-marker): %+v", len(got), got)
+	}
+
+	var dirs, versions, markers int
+	for _, s := range got {
+		switch {
+		case s.isDir:
+			dirs++
+		case s.vid == "v1" && s.size == 10:
+			versions++
+		case s.vid == "vDel" && s.size == 0:
+			markers++
+		}
+	}
+	if dirs != 1 || versions != 1 || markers != 1 {
+		t.Errorf("dirs=%d versions=%d markers=%d, want 1/1/1 each (got=%+v)", dirs, versions, markers, got)
+	}
+}
+
+// TestListObjectVersions_VersionIDFilter exercises the path where the URL
+// pins a specific VersionID: only the matching Version should be emitted,
+// non-matching versions and unrelated delete markers are dropped.
+func TestListObjectVersions_VersionIDFilter(t *testing.T) {
+	body := `<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult>
+  <IsTruncated>false</IsTruncated>
+  <Version>
+    <Key>key1</Key><VersionId>v1</VersionId>
+    <LastModified>2024-01-01T00:00:00Z</LastModified><ETag>"a"</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass>
+  </Version>
+  <Version>
+    <Key>key1</Key><VersionId>v2</VersionId>
+    <LastModified>2024-01-02T00:00:00Z</LastModified><ETag>"b"</ETag><Size>2</Size><StorageClass>STANDARD</StorageClass>
+  </Version>
+</ListVersionsResult>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	u, _ := url.New("s3://my-bucket/key1", url.WithVersion("v2"))
+
+	var got []string
+	for obj := range s.List(context.Background(), u, false) {
+		if obj.Err != nil {
+			t.Fatalf("list error: %v", obj.Err)
+		}
+		got = append(got, obj.URL.VersionID)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d objects, want 1 (only v2 should pass the version-id filter): %v", len(got), got)
+	}
+	if got[0] != "v2" {
+		t.Errorf("got version %q, want v2", got[0])
 	}
 }
 
@@ -483,9 +742,12 @@ func TestDelete_SingleObject(t *testing.T) {
 // requests) rather than the batch DeleteObjects POST that GCS doesn't
 // implement.
 func TestDelete_GCSEndpointPerObjectLoop(t *testing.T) {
-	methods := []string{}
+	var methodsMu sync.Mutex
+	var methods []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methodsMu.Lock()
 		methods = append(methods, r.Method)
+		methodsMu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
@@ -518,6 +780,8 @@ func TestDelete_GCSEndpointPerObjectLoop(t *testing.T) {
 			t.Errorf("MultiDelete err: %v", obj.Err)
 		}
 	}
+	methodsMu.Lock()
+	defer methodsMu.Unlock()
 	for _, m := range methods {
 		if m != http.MethodDelete {
 			t.Errorf("got method %q, want DELETE for GCS per-object loop", m)
@@ -649,13 +913,19 @@ func TestGet_DryRunSkipsRequest(t *testing.T) {
 // TestPut_SingleShot exercises the manager.Uploader single-shot path
 // (small body fits in one PutObject below the part-size threshold).
 func TestPut_SingleShot(t *testing.T) {
-	gotBody := []byte{}
+	var gotBody []byte
 	gotMethod := ""
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
-		buf := make([]byte, 1024)
-		n, _ := r.Body.Read(buf)
-		gotBody = append(gotBody, buf[:n]...)
+		// io.ReadAll, not a single Read into a fixed-size buffer: a single
+		// Read may chunk and an oversized buffer silently truncates the
+		// tail. Either pattern would falsely pass on a regression that
+		// mangles bytes past the first chunk.
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		gotBody = body
 		w.Header().Set("ETag", `"x"`)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -672,6 +942,121 @@ func TestPut_SingleShot(t *testing.T) {
 	}
 	if string(gotBody) != "payload-12345" {
 		t.Errorf("body = %q, want payload-12345", string(gotBody))
+	}
+}
+
+// TestRetryOnNoSuchUpload_SuccessViaStatMatch covers the race-recovery
+// branch: the upload returned NoSuchUpload but the object actually landed
+// with our generated retry-ID stamped into its user-metadata. retryOnNoSuchUpload
+// must Stat, observe the matching retryID, and treat the upload as a
+// success (returning nil instead of the NoSuchUpload error).
+func TestRetryOnNoSuchUpload_SuccessViaStatMatch(t *testing.T) {
+	const noSuchUploadXML = `<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist.</Message></Error>`
+
+	// We don't know the retry-ID up front (it's generated inside Put). The
+	// handler captures it from the first PUT's user-metadata header and
+	// echoes it back on the subsequent HEAD.
+	var capturedRetryID atomic.Value
+	var phase atomic.Int32 // 0=expect PUT, 1=expect HEAD
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch phase.Load() {
+		case 0:
+			if r.Method != http.MethodPut {
+				t.Errorf("phase 0 method = %q, want PUT", r.Method)
+			}
+			capturedRetryID.Store(r.Header.Get("X-Amz-Meta-S5cmd-Upload-Retry-Id"))
+			phase.Store(1)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(noSuchUploadXML))
+		case 1:
+			if r.Method != http.MethodHead {
+				t.Errorf("phase 1 method = %q, want HEAD (Stat in retry loop)", r.Method)
+			}
+			id, _ := capturedRetryID.Load().(string)
+			w.Header().Set("X-Amz-Meta-S5cmd-Upload-Retry-Id", id)
+			w.Header().Set("Content-Length", "5")
+			w.Header().Set("ETag", `"abc"`)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request after retry success: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	resetClientCache(t)
+	s, err := newS3Storage(context.Background(), Options{
+		Endpoint:               srv.URL,
+		NoSignRequest:          true,
+		region:                 "us-east-1",
+		NoSuchUploadRetryCount: 3,
+		LogLevel:               log.LevelInfo,
+	})
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+
+	u, _ := url.New("s3://b/k")
+	if err := s.Put(context.Background(), strings.NewReader("hello"), u, Metadata{}, 1, 5*1024*1024); err != nil {
+		t.Errorf("Put: want nil (Stat-match must rescue NoSuchUpload), got %v", err)
+	}
+	if got := capturedRetryID.Load(); got == nil || got == "" {
+		t.Error("retry-ID was never set on the PUT request")
+	}
+}
+
+// TestRetryOnNoSuchUpload_GivesUp covers the exhaust-retries branch: every
+// PUT returns NoSuchUpload AND every Stat returns 404, so retryOnNoSuchUpload
+// runs out of attempts and wraps the final error with "RetryOnNoSuchUpload".
+func TestRetryOnNoSuchUpload_GivesUp(t *testing.T) {
+	const noSuchUploadXML = `<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist.</Message></Error>`
+
+	var puts, heads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			puts.Add(1)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(noSuchUploadXML))
+		case http.MethodHead:
+			heads.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	resetClientCache(t)
+	s, err := newS3Storage(context.Background(), Options{
+		Endpoint:               srv.URL,
+		NoSignRequest:          true,
+		region:                 "us-east-1",
+		NoSuchUploadRetryCount: 2,
+		LogLevel:               log.LevelInfo,
+	})
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+
+	u, _ := url.New("s3://b/k")
+	err = s.Put(context.Background(), strings.NewReader("hello"), u, Metadata{}, 1, 5*1024*1024)
+	if err == nil {
+		t.Fatal("Put: want non-nil error after exhausting retries")
+	}
+	if !strings.Contains(err.Error(), "RetryOnNoSuchUpload") {
+		t.Errorf("err = %v, want to contain 'RetryOnNoSuchUpload'", err)
+	}
+	if puts.Load() < 2 {
+		t.Errorf("puts = %d, want >= 2 (initial + retries)", puts.Load())
+	}
+	if heads.Load() < 1 {
+		t.Errorf("heads = %d, want >= 1 (Stat in retry loop)", heads.Load())
 	}
 }
 
@@ -777,6 +1162,19 @@ func (w *writerAtBuf) String() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return string(w.buf)
+}
+
+// TestSDKV2Logger_Logf is a smoke test guarding against the nil-deref on
+// the package-global log.Logger that bit during test development. The
+// global is initialized in TestMain, so this test only needs to verify the
+// Logf adapter doesn't panic when called.
+func TestSDKV2Logger_Logf(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("sdkV2Logger.Logf panicked: %v", r)
+		}
+	}()
+	sdkV2Logger{}.Logf(logging.Debug, "smoke %s %d", "trace", 42)
 }
 
 // TestResolveBucketRegion_Success exercises the happy path: probe HeadBucket

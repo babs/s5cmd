@@ -1000,7 +1000,13 @@ func (s *S3) Put(
 
 	_, err := s.uploader.Upload(ctx, input, uploaderOptsFn)
 	if errIsNoSuchUpload(err) && s.noSuchUploadRetryCount > 0 {
-		return cleanV2Err(s.retryOnNoSuchUpload(ctx, to, input, err, uploaderOptsFn))
+		// retryOnNoSuchUpload already wraps with "RetryOnNoSuchUpload:
+		// N attempts ..." for the give-up path. Do NOT pass through
+		// cleanV2Err here -- that would unwrap to the inner
+		// smithy.APIError and discard the user-facing retry context.
+		// The wrapped error still satisfies errors.As(*types.NoSuchUpload)
+		// for downstream classification.
+		return s.retryOnNoSuchUpload(ctx, to, input, err, uploaderOptsFn)
 	}
 	return cleanV2Err(err)
 }

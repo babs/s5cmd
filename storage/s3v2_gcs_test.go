@@ -80,3 +80,50 @@ func TestStripSDKHeadersMiddleware(t *testing.T) {
 		t.Fatal("next handler was not invoked")
 	}
 }
+
+// TestAddGCSHeaderStripMiddleware_StackPlacement verifies the wrapper
+// inserts the Finalize middleware Before the SDK's "Signing" step. If the
+// SDK ever renames or removes that step (it lives at
+// vendor/.../service/s3/auth.go ID() == "Signing"), Insert returns a
+// non-nil error and downstream wiring would silently swallow it via the
+// APIOptions chain -- this test catches that failure mode at unit level.
+func TestAddGCSHeaderStripMiddleware_StackPlacement(t *testing.T) {
+	stack := middleware.NewStack("test", smithyhttp.NewStackRequest)
+	// Insert a stand-in for the Signing middleware so the Insert(_, "Signing", Before)
+	// has a target to anchor against.
+	signing := middleware.FinalizeMiddlewareFunc(
+		"Signing",
+		func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+			return next.HandleFinalize(ctx, in)
+		},
+	)
+	if err := stack.Finalize.Add(signing, middleware.After); err != nil {
+		t.Fatalf("seed Signing middleware: %v", err)
+	}
+
+	if err := addGCSHeaderStripMiddleware(stack); err != nil {
+		t.Fatalf("addGCSHeaderStripMiddleware: %v", err)
+	}
+
+	// The Finalize step must now contain both the strip middleware and
+	// the Signing stand-in, in that order.
+	ids := stack.Finalize.List()
+	var stripIdx, signIdx = -1, -1
+	for i, id := range ids {
+		switch id {
+		case "S5cmdGCSStripSDKHeaders":
+			stripIdx = i
+		case "Signing":
+			signIdx = i
+		}
+	}
+	if stripIdx < 0 {
+		t.Fatalf("S5cmdGCSStripSDKHeaders not found in Finalize step (have %v)", ids)
+	}
+	if signIdx < 0 {
+		t.Fatalf("Signing not found in Finalize step (have %v)", ids)
+	}
+	if stripIdx >= signIdx {
+		t.Errorf("strip middleware at %d, Signing at %d -- strip must run BEFORE Signing", stripIdx, signIdx)
+	}
+}

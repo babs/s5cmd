@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -144,6 +145,144 @@ func TestRequestPayerEnum(t *testing.T) {
 		})
 	}
 }
+
+func TestParseInputSerialization(t *testing.T) {
+	cases := []struct {
+		name        string
+		ev          eventType
+		compression string
+		delim       string
+		header      string
+		wantErr     bool
+		check       func(t *testing.T, in *s3types.InputSerialization)
+	}{
+		{
+			name: "json document type",
+			ev:   jsonType, delim: "DOCUMENT",
+			check: func(t *testing.T, in *s3types.InputSerialization) {
+				if in.JSON == nil {
+					t.Fatal("JSON nil")
+				}
+				if in.JSON.Type != "DOCUMENT" {
+					t.Errorf("JSON.Type = %q", in.JSON.Type)
+				}
+				if in.CompressionType != "" {
+					t.Errorf("CompressionType = %q, want empty", in.CompressionType)
+				}
+			},
+		},
+		{
+			name: "json with gzip compression",
+			ev:   jsonType, delim: "LINES", compression: "GZIP",
+			check: func(t *testing.T, in *s3types.InputSerialization) {
+				if in.CompressionType != "GZIP" {
+					t.Errorf("CompressionType = %q, want GZIP", in.CompressionType)
+				}
+			},
+		},
+		{
+			name: "csv with header",
+			ev:   csvType, delim: ",", header: "USE",
+			check: func(t *testing.T, in *s3types.InputSerialization) {
+				if in.CSV == nil {
+					t.Fatal("CSV nil")
+				}
+				if in.CSV.FileHeaderInfo != "USE" {
+					t.Errorf("FileHeaderInfo = %q, want USE", in.CSV.FileHeaderInfo)
+				}
+				if got := in.CSV.FieldDelimiter; got == nil || *got != "," {
+					t.Errorf("FieldDelimiter = %v, want ','", got)
+				}
+			},
+		},
+		{
+			name: "parquet (no compression / delimiter applies)",
+			ev:   parquetType,
+			check: func(t *testing.T, in *s3types.InputSerialization) {
+				if in.Parquet == nil {
+					t.Fatal("Parquet nil")
+				}
+				if in.JSON != nil || in.CSV != nil {
+					t.Error("Parquet input must not also set JSON/CSV")
+				}
+			},
+		},
+		{
+			name: "unknown format -> error",
+			ev:   "yaml", wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in, err := parseInputSerialization(tc.ev, tc.compression, tc.delim, tc.header)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if !tc.wantErr {
+				tc.check(t, in)
+			}
+		})
+	}
+}
+
+func TestParseOutputSerialization(t *testing.T) {
+	cases := []struct {
+		name    string
+		ev      eventType
+		delim   string
+		wantErr bool
+		check   func(t *testing.T, out *s3types.OutputSerialization, dec EventStreamDecoder)
+	}{
+		{
+			name: "json output",
+			ev:   jsonType,
+			check: func(t *testing.T, out *s3types.OutputSerialization, dec EventStreamDecoder) {
+				if out.JSON == nil {
+					t.Error("JSON output nil")
+				}
+				if dec == nil {
+					t.Error("decoder nil")
+				}
+			},
+		},
+		{
+			name: "csv output", ev: csvType, delim: ";",
+			check: func(t *testing.T, out *s3types.OutputSerialization, dec EventStreamDecoder) {
+				if out.CSV == nil {
+					t.Fatal("CSV output nil")
+				}
+				if got := out.CSV.FieldDelimiter; got == nil || *got != ";" {
+					t.Errorf("FieldDelimiter = %v, want ';'", got)
+				}
+				if dec == nil {
+					t.Error("decoder nil")
+				}
+			},
+		},
+		{
+			name: "unknown format -> error",
+			ev:   "parquet", wantErr: true, // parquet output not supported by S3 Select
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, dec, err := parseOutputSerialization(tc.ev, tc.delim, strings.NewReader(""))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+			if !tc.wantErr {
+				tc.check(t, out, dec)
+			}
+		})
+	}
+}
+
+// Note: full Select event-stream wire-level test (server returns properly
+// framed binary event-stream payload with CRC32C checksums) is not provided
+// here -- the framing is non-trivial to hand-craft. Select coverage at the
+// dispatch level (tagged-union member type-switch on RecordsEvent) is left
+// to e2e against gofakes3 / real S3. The serialization helpers above cover
+// the request-side Select wiring at unit level.
 
 func TestS3SatisfiesStorageInterface(t *testing.T) {
 	// Compile-time check exists in s3v2_api.go via `var _ Storage = (*S3)(nil)`.

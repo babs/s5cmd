@@ -170,12 +170,6 @@ func (cc *clientCache) newClient(ctx context.Context, opts Options) (*s3v2.Clien
 	return client, nil
 }
 
-func (cc *clientCache) clear() {
-	cc.Lock()
-	defer cc.Unlock()
-	cc.clients = map[Options]*s3v2.Client{}
-}
-
 // sdkV2Logger adapts smithy-go's logging.Logger to s5cmd's trace channel.
 type sdkV2Logger struct{}
 
