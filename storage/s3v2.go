@@ -114,9 +114,13 @@ func (cc *clientCache) newClient(ctx context.Context, opts Options) (*s3v2.Clien
 		config.WithRetryer(func() awsv2.Retryer {
 			return retry.AddWithErrorCodes(
 				retry.NewStandard(func(o *retry.StandardOptions) {
-					if opts.MaxRetries > 0 {
-						o.MaxAttempts = opts.MaxRetries + 1
-					}
+					// MaxAttempts is set unconditionally so opts.MaxRetries=0
+					// means "1 attempt, no retries" -- matching v1's
+					// client.DefaultRetryer{NumMaxRetries: 0} contract.
+					// Without this, retry.Standard falls back to its default
+					// (MaxAttempts=3) and silently re-enables retries for
+					// callers that explicitly opted out.
+					o.MaxAttempts = opts.MaxRetries + 1
 				}),
 				// Preserved from v1 customRetryer.ShouldRetry.
 				"InternalError",

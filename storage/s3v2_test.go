@@ -1461,6 +1461,78 @@ func (w *writerAtBuf) String() string {
 	return string(w.buf)
 }
 
+// TestNewClient_MaxRetriesZero pins the "0 retries means exactly 1 attempt"
+// contract. v2's retry.Standard defaults MaxAttempts to 3 when unset; the
+// storage layer must override that default to match v1's
+// client.DefaultRetryer{NumMaxRetries: 0} semantics, otherwise users who
+// explicitly pass --retry-count=0 (for deterministic scripts, tight SLO
+// loops, or fail-fast tests) silently get 2 extra retries they did not ask
+// for.
+//
+// A 503 response is retryable under retry.Standard's default policy, so it
+// is the cheapest way to prove retries did or did not happen: count the
+// HTTP hits against the stub server for one storage-layer call.
+func TestNewClient_MaxRetriesZero(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	resetClientCache(t)
+	opts := Options{
+		Endpoint:      srv.URL,
+		NoSignRequest: true,
+		region:        "us-east-1",
+		MaxRetries:    0, // explicit: "no retries"
+		LogLevel:      log.LevelInfo,
+	}
+	s, err := newS3Storage(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+
+	u, _ := url.New("s3://b/k")
+	_, _ = s.Stat(context.Background(), u) // error expected; we care about hit count
+	if got := hits.Load(); got != 1 {
+		t.Errorf("hits = %d, want 1 (MaxRetries=0 must NOT retry transient 5xx)", got)
+	}
+}
+
+// TestNewClient_MaxRetriesTwo sanity-checks the positive side of the
+// contract: with MaxRetries=2, a persistently failing 503 produces 3
+// attempts (1 initial + 2 retries). This guards against the opposite
+// regression (too few retries) if a future refactor misreads the
+// attempts/retries off-by-one.
+func TestNewClient_MaxRetriesTwo(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	resetClientCache(t)
+	opts := Options{
+		Endpoint:      srv.URL,
+		NoSignRequest: true,
+		region:        "us-east-1",
+		MaxRetries:    2,
+		LogLevel:      log.LevelInfo,
+	}
+	s, err := newS3Storage(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+
+	u, _ := url.New("s3://b/k")
+	_, _ = s.Stat(context.Background(), u)
+	if got := hits.Load(); got != 3 {
+		t.Errorf("hits = %d, want 3 (MaxRetries=2 -> 1 initial + 2 retries)", got)
+	}
+}
+
 // TestSDKV2Logger_Logf is a smoke test guarding against the nil-deref on
 // the package-global log.Logger that bit during test development. The
 // global is initialized in TestMain, so this test only needs to verify the
