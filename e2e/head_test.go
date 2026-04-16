@@ -55,7 +55,7 @@ func TestHeadBucketNonExistent(t *testing.T) {
 	result.Assert(t, icmd.Expected{ExitCode: 1})
 
 	assertLines(t, result.Stderr(), map[int]compareFunc{
-		0: contains(`ERROR "head s3://non-existent-bucket": NotFound`),
+		0: equals(`ERROR "head s3://non-existent-bucket": NotFound`),
 	})
 }
 
@@ -88,7 +88,7 @@ func TestHeadBucketJSONNonExistent(t *testing.T) {
 	result := icmd.RunCmd(cmd)
 
 	result.Assert(t, icmd.Expected{ExitCode: 1})
-	assert.Equal(t, strings.Contains(result.Stderr(), `"error":"NotFound`), true)
+	assert.Equal(t, strings.Contains(result.Stderr(), `"error":"NotFound"`), true)
 }
 
 // head object
