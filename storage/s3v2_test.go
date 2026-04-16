@@ -48,6 +48,12 @@ func newTestS3(t *testing.T, srv *httptest.Server) *S3 {
 // so per-test Init/Close pairs would panic on the second test ("send on
 // closed channel"). Initialize once at "error" level (silent for normal
 // tests) and never tear down -- the test binary process exits anyway.
+//
+// Note: log.Init starts a consumer goroutine on outputCh. We intentionally
+// do not Close() -- process termination reaps it. If a future test needs
+// to assert clean-shutdown semantics on the log package itself, that test
+// will need a different init pattern (e.g. a fresh child process or a
+// refactor of the log package to accept a per-instance channel).
 func TestMain(m *testing.M) {
 	log.Init("error", false)
 	os.Exit(m.Run())
@@ -250,6 +256,31 @@ func TestHeadObject_EmptyMetadataIsMap(t *testing.T) {
 	}
 }
 
+// TestHeadObject_VersionedPath covers the `if u.VersionID != ""` branch:
+// the request must carry ?versionId=... as a query parameter so S3 serves
+// the specific version rather than the current one.
+func TestHeadObject_VersionedPath(t *testing.T) {
+	var gotQuery atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery.Store(r.URL.RawQuery)
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("ETag", `"v"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	u, _ := url.New("s3://b/k", url.WithVersion("v-abc-123"))
+
+	if _, _, err := s.HeadObject(context.Background(), u); err != nil {
+		t.Fatalf("HeadObject: %v", err)
+	}
+	q, _ := gotQuery.Load().(string)
+	if !strings.Contains(q, "versionId=v-abc-123") {
+		t.Errorf("query = %q, want to contain versionId=v-abc-123", q)
+	}
+}
+
 func TestHeadObject_StorageClassDefaultStandard(t *testing.T) {
 	// S3 omits the StorageClass header for STANDARD-class objects; storage
 	// layer must default to "STANDARD" rather than empty.
@@ -296,6 +327,50 @@ func TestRead_StreamsBody(t *testing.T) {
 	}
 	if string(got) != body {
 		t.Errorf("body = %q, want %q", string(got), body)
+	}
+}
+
+func TestMakeBucket_Success(t *testing.T) {
+	gotMethod := ""
+	gotPath := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	if err := s.MakeBucket(context.Background(), "new-bucket"); err != nil {
+		t.Fatalf("MakeBucket: %v", err)
+	}
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %q, want PUT", gotMethod)
+	}
+	if !strings.Contains(gotPath, "new-bucket") {
+		t.Errorf("path = %q, want to contain new-bucket", gotPath)
+	}
+}
+
+func TestRemoveBucket_Success(t *testing.T) {
+	gotMethod := ""
+	gotPath := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	if err := s.RemoveBucket(context.Background(), "old-bucket"); err != nil {
+		t.Fatalf("RemoveBucket: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Errorf("method = %q, want DELETE", gotMethod)
+	}
+	if !strings.Contains(gotPath, "old-bucket") {
+		t.Errorf("path = %q, want to contain old-bucket", gotPath)
 	}
 }
 
@@ -842,6 +917,161 @@ func TestCopy_VersionedSource(t *testing.T) {
 	}
 }
 
+// TestCopy_MetadataFields verifies every Metadata field wires to the
+// correct outgoing header. One oversight in a typed-enum cast (e.g.
+// ObjectCannedACL vs StorageClass) would silently swap or drop
+// user-specified attributes; catching it at unit level is cheaper than
+// finding out from a report about missing encryption on a production
+// bucket.
+func TestCopy_MetadataFields(t *testing.T) {
+	var gotHeaders atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Snapshot headers as a map so the test-side asserts read
+		// deterministically.
+		snapshot := make(map[string]string, len(r.Header))
+		for k, v := range r.Header {
+			if len(v) > 0 {
+				snapshot[k] = v[0]
+			}
+		}
+		gotHeaders.Store(snapshot)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>"x"</ETag></CopyObjectResult>`))
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	src, _ := url.New("s3://src/k")
+	dst, _ := url.New("s3://dst/k")
+	meta := Metadata{
+		ACL:                "private",
+		CacheControl:       "max-age=60",
+		Expires:            "2030-01-02T03:04:05Z",
+		StorageClass:       "STANDARD_IA",
+		ContentType:        "application/json",
+		ContentEncoding:    "gzip",
+		ContentDisposition: "attachment",
+		EncryptionMethod:   "aws:kms",
+		EncryptionKeyID:    "arn:aws:kms:us-east-1:111122223333:key/abcd",
+		Directive:          "REPLACE",
+		UserDefined:        map[string]string{"owner": "alice"},
+	}
+	if err := s.Copy(context.Background(), src, dst, meta); err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+
+	h, _ := gotHeaders.Load().(map[string]string)
+	checks := map[string]string{
+		"X-Amz-Acl":                                   "private",
+		"Cache-Control":                               "max-age=60",
+		"X-Amz-Storage-Class":                         "STANDARD_IA",
+		"Content-Type":                                "application/json",
+		"Content-Encoding":                            "gzip",
+		"Content-Disposition":                         "attachment",
+		"X-Amz-Server-Side-Encryption":                "aws:kms",
+		"X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id": "arn:aws:kms:us-east-1:111122223333:key/abcd",
+		"X-Amz-Metadata-Directive":                    "REPLACE",
+		"X-Amz-Meta-Owner":                            "alice",
+	}
+	for k, want := range checks {
+		if got := h[k]; got != want {
+			t.Errorf("header %q = %q, want %q", k, got, want)
+		}
+	}
+	// Expires goes into a parsed field (input.Expires *time.Time) and then
+	// the SDK renders it as RFC1123 in the X-Amz-Expires or Expires header.
+	// We don't assert the exact rendering (SDK quirk); asserting it is
+	// non-empty catches the branch where time.Parse failed silently.
+	if h["Expires"] == "" && h["X-Amz-Expires"] == "" {
+		t.Errorf("Expires metadata field did not produce any Expires/X-Amz-Expires header (headers=%v)", h)
+	}
+}
+
+// TestCopy_ExpiresParseError covers the time.Parse error branch: an
+// unparseable Expires string must surface as an error before the request
+// is issued.
+func TestCopy_ExpiresParseError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("Copy must not dial when Expires fails to parse: got %s %s", r.Method, r.URL)
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	src, _ := url.New("s3://src/k")
+	dst, _ := url.New("s3://dst/k")
+	err := s.Copy(context.Background(), src, dst, Metadata{Expires: "not-a-time"})
+	if err == nil {
+		t.Fatal("Copy: want non-nil error for unparseable Expires, got nil")
+	}
+}
+
+// TestPut_MetadataFields mirrors the Copy test for the upload path.
+// MetadataDirective is Copy-only so it's not asserted here.
+func TestPut_MetadataFields(t *testing.T) {
+	var gotHeaders atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		snapshot := make(map[string]string, len(r.Header))
+		for k, v := range r.Header {
+			if len(v) > 0 {
+				snapshot[k] = v[0]
+			}
+		}
+		gotHeaders.Store(snapshot)
+		w.Header().Set("ETag", `"x"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	u, _ := url.New("s3://b/k")
+	meta := Metadata{
+		ACL:                "public-read",
+		CacheControl:       "no-cache",
+		Expires:            "2030-01-02T03:04:05Z",
+		StorageClass:       "ONEZONE_IA",
+		ContentType:        "text/plain",
+		ContentEncoding:    "identity",
+		ContentDisposition: "inline",
+		EncryptionMethod:   "AES256",
+		UserDefined:        map[string]string{"project": "atlas"},
+	}
+	if err := s.Put(context.Background(), strings.NewReader("hello"), u, meta, 1, 5*1024*1024); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	h, _ := gotHeaders.Load().(map[string]string)
+	checks := map[string]string{
+		"X-Amz-Acl":                    "public-read",
+		"Cache-Control":                "no-cache",
+		"X-Amz-Storage-Class":          "ONEZONE_IA",
+		"Content-Type":                 "text/plain",
+		"Content-Encoding":             "identity",
+		"Content-Disposition":          "inline",
+		"X-Amz-Server-Side-Encryption": "AES256",
+		"X-Amz-Meta-Project":           "atlas",
+	}
+	for k, want := range checks {
+		if got := h[k]; got != want {
+			t.Errorf("header %q = %q, want %q", k, got, want)
+		}
+	}
+}
+
+func TestPut_ExpiresParseError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("Put must not dial when Expires fails to parse: got %s %s", r.Method, r.URL)
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	u, _ := url.New("s3://b/k")
+	err := s.Put(context.Background(), strings.NewReader("hello"), u, Metadata{Expires: "bogus"}, 1, 5*1024*1024)
+	if err == nil {
+		t.Fatal("Put: want non-nil error for unparseable Expires, got nil")
+	}
+}
+
 func TestCopy_DryRunSkipsRequest(t *testing.T) {
 	hits := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
@@ -1057,6 +1287,73 @@ func TestRetryOnNoSuchUpload_GivesUp(t *testing.T) {
 	}
 	if heads.Load() < 1 {
 		t.Errorf("heads = %d, want >= 1 (Stat in retry loop)", heads.Load())
+	}
+}
+
+// TestRetryOnNoSuchUpload_RetryReturnsDifferentError covers the branch
+// where a retry attempt produces a non-NoSuchUpload error (e.g. credentials
+// rotated mid-flight so the second PUT comes back AccessDenied). The loop
+// exits because errIsNoSuchUpload is now false on the new error; the
+// give-up wrapper also doesn't fire. The returned error must be normalized
+// to the v1-shape "Code: Message" string rather than the raw verbose
+// smithy OperationError -- the rest of Put's contract is the clean form.
+func TestRetryOnNoSuchUpload_RetryReturnsDifferentError(t *testing.T) {
+	const noSuchUploadXML = `<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist.</Message></Error>`
+	const accessDeniedXML = `<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>`
+
+	var puts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			n := puts.Add(1)
+			w.Header().Set("Content-Type", "application/xml")
+			if n == 1 {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(noSuchUploadXML))
+			} else {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(accessDeniedXML))
+			}
+		case http.MethodHead:
+			// Stat in the retry loop: object not yet there, retry PUT.
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	resetClientCache(t)
+	s, err := newS3Storage(context.Background(), Options{
+		Endpoint:               srv.URL,
+		NoSignRequest:          true,
+		region:                 "us-east-1",
+		NoSuchUploadRetryCount: 2,
+		LogLevel:               log.LevelInfo,
+	})
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+
+	u, _ := url.New("s3://b/k")
+	err = s.Put(context.Background(), strings.NewReader("hello"), u, Metadata{}, 1, 5*1024*1024)
+	if err == nil {
+		t.Fatal("Put: want non-nil error (AccessDenied from retry)")
+	}
+	// v1-shape: "Code: Message". Must NOT contain the verbose smithy
+	// OperationError wrapping ("operation error S3: ...").
+	if strings.Contains(err.Error(), "operation error S3") {
+		t.Errorf("err = %v; want v1-shape 'Code: Message', got raw smithy OperationError", err)
+	}
+	if !strings.Contains(err.Error(), "AccessDenied") {
+		t.Errorf("err = %v; want to contain 'AccessDenied'", err)
+	}
+	// Retry loop must NOT have wrapped with RetryOnNoSuchUpload since the
+	// final error is not NoSuchUpload.
+	if strings.Contains(err.Error(), "RetryOnNoSuchUpload") {
+		t.Errorf("err = %v; must NOT be wrapped with RetryOnNoSuchUpload when the final error is different", err)
 	}
 }
 

@@ -1040,8 +1040,17 @@ func (s *S3) retryOnNoSuchUpload(
 	}
 
 	if errIsNoSuchUpload(err) && s.noSuchUploadRetryCount > 0 {
+		// Wrap with the retry context; %w keeps the inner smithy.APIError
+		// reachable via errors.As for downstream classification.
 		err = fmt.Errorf("RetryOnNoSuchUpload: %d attempts to retry resulted in NoSuchUpload: %w",
 			attempts, err)
+	} else {
+		// A retry attempt may have produced a different error (e.g.
+		// AccessDenied after credentials rotate, SlowDown under sustained
+		// pressure). Normalize that to the v1-shape "Code: Message" so
+		// the retry branch does not emit a verbose smithy OperationError
+		// string while the normal Put path returns the clean form.
+		err = cleanV2Err(err)
 	}
 	return err
 }
@@ -1100,6 +1109,15 @@ func parseOutputSerialization(e eventType, delimiter string, reader io.Reader) (
 // Select streams S3 Select results into resultCh. Tagged-union event handling
 // in v2: types.SelectObjectContentEventStream is an interface; the records
 // payload arrives as *types.SelectObjectContentEventStreamMemberRecords.
+//
+// Unit-test coverage: parseInputSerialization / parseOutputSerialization
+// exercise the request-side wiring. The event-stream response loop below
+// is covered by e2e only -- synthesizing a valid smithy event-stream
+// response (binary frames with per-message CRC32C checksums, prelude +
+// headers + payload + trailer) is impractical without vendoring the
+// encoder, and the dispatch logic here is four lines of tagged-union
+// type-switch. Regressions in the framing itself would show up the first
+// time a user runs `s5cmd select` against real S3 or gofakes3.
 func (s *S3) Select(ctx context.Context, u *url.URL, query *SelectQuery, resultCh chan<- json.RawMessage) error {
 	if s.dryRun {
 		return nil
