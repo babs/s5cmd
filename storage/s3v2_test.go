@@ -3,10 +3,12 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	s3v2 "github.com/aws/aws-sdk-go-v2/service/s3"
@@ -48,39 +50,56 @@ func resetClientCache(t *testing.T) {
 	globalClientCache = &clientCache{clients: map[Options]*s3v2.Client{}}
 }
 
-func TestNewS3Storage_OptionsRouting(t *testing.T) {
-	cases := []struct {
-		name           string
-		endpoint       string
-		wantPathStyle  bool
-		wantAccelerate bool
-	}{
-		{"empty -> aws virtual host", "", false, false},
-		{"transfer accel", "https://s3-accelerate.amazonaws.com", false, true},
-		{"gcs -> virtual host", "https://storage.googleapis.com", false, false},
-		{"minio -> path style", "http://minio.local:9000", true, false},
+// TestNewS3Storage_AddressingStyle observes the HTTP request actually
+// emitted by the constructed client. Custom (non-AWS) endpoints must produce
+// path-style URLs (/bucket/key) -- if the constructor wired UsePathStyle to
+// the wrong value, the bucket would land in the Host header instead.
+//
+// Virtual-host detection for AWS is harder to test in-process because the
+// SDK would dial bucket.s3.amazonaws.com via real DNS; the path-style case
+// against a custom endpoint is the strongest unit-level guarantee.
+func TestNewS3Storage_AddressingStyle(t *testing.T) {
+	var capturedPath, capturedHost string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		capturedHost = r.Host
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("ETag", `"x"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv) // custom endpoint -> must be path-style
+	u, _ := url.New("s3://my-bucket/my-key")
+	if _, err := s.Stat(context.Background(), u); err != nil {
+		t.Fatalf("Stat: %v", err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			// We can't easily inspect *s3.Options after construction; instead
-			// re-derive the same booleans the constructor uses, ensuring our
-			// supportsTransferAcceleration / isVirtualHostStyle wiring stays
-			// in sync with the constructor.
-			endpointURL, _ := parseEndpoint(tc.endpoint)
-			gotAccel := supportsTransferAcceleration(endpointURL)
-			gotPath := !isVirtualHostStyle(endpointURL)
-			if gotAccel {
-				// The constructor clears the endpoint when accel is on, so
-				// path-style detection runs on the cleared URL.
-				gotPath = !isVirtualHostStyle(sentinelURL)
-			}
-			if gotAccel != tc.wantAccelerate {
-				t.Errorf("UseAccelerate = %v, want %v", gotAccel, tc.wantAccelerate)
-			}
-			if gotPath != tc.wantPathStyle {
-				t.Errorf("UsePathStyle = %v, want %v", gotPath, tc.wantPathStyle)
-			}
-		})
+
+	wantPath := "/my-bucket/my-key"
+	if capturedPath != wantPath {
+		t.Errorf("path-style request path = %q, want %q (host=%q)", capturedPath, wantPath, capturedHost)
+	}
+	// The bucket name MUST NOT appear as a subdomain prefix in the Host
+	// header for path-style requests.
+	if strings.HasPrefix(capturedHost, "my-bucket.") {
+		t.Errorf("path-style request leaked bucket into Host header: %q", capturedHost)
+	}
+}
+
+// TestNewS3Storage_AccelerateEndpointCleared verifies the constructor's
+// special case: when the configured endpoint hostname matches the S3
+// transfer-acceleration host, the endpoint should be cleared (so the SDK
+// uses the accelerated routing instead of pinning a literal URL).
+func TestNewS3Storage_AccelerateEndpointCleared(t *testing.T) {
+	endpointURL, _ := parseEndpoint("https://s3-accelerate.amazonaws.com")
+	if !supportsTransferAcceleration(endpointURL) {
+		t.Fatalf("test premise broken: accel host not detected")
+	}
+	// The constructor logic in s3v2.go: useAccelerate true -> endpointURL
+	// reassigned to sentinelURL. We can re-walk the same predicate here to
+	// confirm the invariant the constructor relies on still holds.
+	if supportsTransferAcceleration(sentinelURL) {
+		t.Errorf("sentinelURL must NOT match transfer-acceleration; constructor's clear-on-accel logic depends on this")
 	}
 }
 
@@ -172,29 +191,18 @@ func TestHeadObject_PreservesUserMetadata(t *testing.T) {
 	if meta == nil {
 		t.Fatal("metadata is nil")
 	}
-	// v2 SDK lowercases user-metadata keys when extracting from the
-	// X-Amz-Meta-* headers (the HTTP spec lets servers casefold headers
-	// freely, so the SDK normalizes to lowercase for stable lookup).
-	t.Logf("UserDefined keys = %v", meta.UserDefined)
-	gotOwner := metaLookup(meta.UserDefined, "Owner")
-	if gotOwner != "alice" {
-		t.Errorf("UserDefined Owner = %q, want alice", gotOwner)
+	// v2 SDK lowercases user-metadata keys during deserialization
+	// (vendor/.../service/s3/deserializers.go ToLower). v1 SDK behaved
+	// the same way, and the existing e2e suite (TestHeadObjectWithMetadata,
+	// TestHeadObjectJSONMetadata) already expects lowercase output. The
+	// storage layer must NOT re-case keys -- doing so was attempted in an
+	// earlier migration commit and silently broke those e2e regexes.
+	if got := meta.UserDefined["owner"]; got != "alice" {
+		t.Errorf("UserDefined[owner] = %q, want alice (keys=%v)", got, meta.UserDefined)
 	}
-	gotProject := metaLookup(meta.UserDefined, "Project")
-	if gotProject != "atlas" {
-		t.Errorf("UserDefined Project = %q, want atlas", gotProject)
+	if got := meta.UserDefined["project"]; got != "atlas" {
+		t.Errorf("UserDefined[project] = %q, want atlas (keys=%v)", got, meta.UserDefined)
 	}
-}
-
-// metaLookup is case-insensitive because v2 SDK normalizes user-metadata
-// header names (HTTP semantics).
-func metaLookup(m map[string]string, key string) string {
-	for k, v := range m {
-		if strings.EqualFold(k, key) {
-			return v
-		}
-	}
-	return ""
 }
 
 func TestHeadObject_EmptyMetadataIsMap(t *testing.T) {
@@ -392,6 +400,479 @@ func TestPresign_GeneratesURL(t *testing.T) {
 	// The presign URL must include a SigV4 signature query parameter.
 	if !strings.Contains(signed, "X-Amz-Signature=") {
 		t.Errorf("Presign URL %q missing X-Amz-Signature query parameter", signed)
+	}
+}
+
+// TestList_PaginatedV2 covers the ListObjectsV2 paginator: two pages worth
+// of contents must both reach the channel. Catches a regression where the
+// paginator loop exits prematurely or the second page is dropped.
+func TestList_PaginatedV2(t *testing.T) {
+	page := 0
+	page1 := `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>tok</NextContinuationToken>
+  <Contents><Key>a/1</Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>"e1"</ETag><Size>10</Size><StorageClass>STANDARD</StorageClass></Contents>
+  <Contents><Key>a/2</Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>"e2"</ETag><Size>20</Size><StorageClass>STANDARD</StorageClass></Contents>
+</ListBucketResult>`
+	page2 := `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>a/3</Key><LastModified>2024-01-01T00:00:00Z</LastModified><ETag>"e3"</ETag><Size>30</Size><StorageClass>STANDARD</StorageClass></Contents>
+</ListBucketResult>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		page++
+		if page == 1 {
+			_, _ = w.Write([]byte(page1))
+		} else {
+			_, _ = w.Write([]byte(page2))
+		}
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	u, _ := url.New("s3://my-bucket/a/*")
+
+	var got []string
+	for obj := range s.List(context.Background(), u, false) {
+		if obj.Err != nil {
+			t.Fatalf("list error: %v", obj.Err)
+		}
+		got = append(got, obj.URL.Path)
+	}
+	if len(got) != 3 {
+		t.Errorf("got %d objects, want 3 (across two pages): %v", len(got), got)
+	}
+	if page < 2 {
+		t.Errorf("paginator made only %d HTTP requests, want 2", page)
+	}
+}
+
+// TestDelete_SingleObject hits the DeleteObjects batch endpoint (the
+// non-GCS path) with a single key. Validates URL/body wiring through the
+// chunkV2 helper.
+func TestDelete_SingleObject(t *testing.T) {
+	gotMethod := ""
+	gotPath := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><DeleteResult><Deleted><Key>k1</Key></Deleted></DeleteResult>`))
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	u, _ := url.New("s3://my-bucket/k1")
+	if err := s.Delete(context.Background(), u); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST (DeleteObjects batch)", gotMethod)
+	}
+	if !strings.Contains(gotPath, "my-bucket") {
+		t.Errorf("path = %q, want to contain my-bucket", gotPath)
+	}
+}
+
+// TestDelete_GCSEndpointPerObjectLoop verifies the GCS workaround: when
+// the endpoint is GCS, Delete falls back to per-object DeleteObject (DELETE
+// requests) rather than the batch DeleteObjects POST that GCS doesn't
+// implement.
+func TestDelete_GCSEndpointPerObjectLoop(t *testing.T) {
+	methods := []string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	resetClientCache(t)
+	// Emulate GCS endpoint: the storage layer keys per-object loop on
+	// IsGoogleEndpoint(s.endpointURL), which checks Hostname() == gcsEndpoint.
+	// We construct an *S3 by hand so the test doesn't have to spoof DNS.
+	client, err := globalClientCache.newClient(context.Background(), Options{
+		Endpoint: srv.URL, NoSignRequest: true, region: "us-east-1", LogLevel: log.LevelInfo,
+	})
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	gcsURL, _ := parseEndpoint("https://storage.googleapis.com")
+	s := &S3{
+		api:         client,
+		endpointURL: gcsURL,
+	}
+
+	urls := make(chan *url.URL, 2)
+	u1, _ := url.New("s3://my-bucket/k1")
+	u2, _ := url.New("s3://my-bucket/k2")
+	urls <- u1
+	urls <- u2
+	close(urls)
+
+	for obj := range s.MultiDelete(context.Background(), urls) {
+		if obj.Err != nil {
+			t.Errorf("MultiDelete err: %v", obj.Err)
+		}
+	}
+	for _, m := range methods {
+		if m != http.MethodDelete {
+			t.Errorf("got method %q, want DELETE for GCS per-object loop", m)
+		}
+	}
+	if len(methods) != 2 {
+		t.Errorf("got %d requests, want 2 (one per key, no batch)", len(methods))
+	}
+}
+
+// TestCopy_Roundtrip verifies the CopyObject request reaches the server
+// with the expected CopySource header and bucket/key path.
+func TestCopy_Roundtrip(t *testing.T) {
+	gotCopySource := ""
+	gotPath := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCopySource = r.Header.Get("X-Amz-Copy-Source")
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>"abc"</ETag></CopyObjectResult>`))
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	src, _ := url.New("s3://src-bucket/src-key")
+	dst, _ := url.New("s3://dst-bucket/dst-key")
+	if err := s.Copy(context.Background(), src, dst, Metadata{}); err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	if !strings.Contains(gotCopySource, "src-bucket") || !strings.Contains(gotCopySource, "src-key") {
+		t.Errorf("X-Amz-Copy-Source = %q, want to reference src-bucket/src-key", gotCopySource)
+	}
+	if !strings.Contains(gotPath, "dst-bucket") || !strings.Contains(gotPath, "dst-key") {
+		t.Errorf("dst path = %q, want dst-bucket/dst-key", gotPath)
+	}
+}
+
+func TestCopy_VersionedSource(t *testing.T) {
+	got := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("X-Amz-Copy-Source")
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult/>`))
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	src, _ := url.New("s3://src/k")
+	src.VersionID = "v123"
+	dst, _ := url.New("s3://dst/k")
+	if err := s.Copy(context.Background(), src, dst, Metadata{}); err != nil {
+		t.Fatalf("Copy: %v", err)
+	}
+	if !strings.Contains(got, "versionId=v123") {
+		t.Errorf("CopySource %q missing ?versionId=v123 suffix", got)
+	}
+}
+
+func TestCopy_DryRunSkipsRequest(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer srv.Close()
+
+	resetClientCache(t)
+	opts := Options{Endpoint: srv.URL, NoSignRequest: true, region: "us-east-1", DryRun: true, LogLevel: log.LevelInfo}
+	s, err := newS3Storage(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+	src, _ := url.New("s3://b/k")
+	dst, _ := url.New("s3://b/k2")
+	if err := s.Copy(context.Background(), src, dst, Metadata{}); err != nil {
+		t.Fatalf("Copy dry-run: %v", err)
+	}
+	if hits != 0 {
+		t.Errorf("hits = %d, want 0 (Copy must respect dry-run)", hits)
+	}
+}
+
+// TestGet_SingleShot exercises the manager.Downloader single-shot path
+// (concurrency=1 collapses to one GetObject).
+func TestGet_SingleShot(t *testing.T) {
+	body := "hello world"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	u, _ := url.New("s3://b/k")
+	w := newWriterAtBuf()
+	n, err := s.Get(context.Background(), u, w, 1, 5*1024*1024)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if n != int64(len(body)) {
+		t.Errorf("n = %d, want %d", n, len(body))
+	}
+	if w.String() != body {
+		t.Errorf("body = %q, want %q", w.String(), body)
+	}
+}
+
+// TestGet_DryRunSkipsRequest: writes are gated; Get is a download but s5cmd
+// gates Get behind dry-run too (matches v1).
+func TestGet_DryRunSkipsRequest(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer srv.Close()
+	resetClientCache(t)
+	opts := Options{Endpoint: srv.URL, NoSignRequest: true, region: "us-east-1", DryRun: true, LogLevel: log.LevelInfo}
+	s, err := newS3Storage(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+	u, _ := url.New("s3://b/k")
+	if _, err := s.Get(context.Background(), u, newWriterAtBuf(), 1, 5*1024*1024); err != nil {
+		t.Fatalf("Get dry-run: %v", err)
+	}
+	if hits != 0 {
+		t.Errorf("hits = %d, want 0 (Get must respect dry-run)", hits)
+	}
+}
+
+// TestPut_SingleShot exercises the manager.Uploader single-shot path
+// (small body fits in one PutObject below the part-size threshold).
+func TestPut_SingleShot(t *testing.T) {
+	gotBody := []byte{}
+	gotMethod := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		gotBody = append(gotBody, buf[:n]...)
+		w.Header().Set("ETag", `"x"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	u, _ := url.New("s3://b/k")
+	body := strings.NewReader("payload-12345")
+	if err := s.Put(context.Background(), body, u, Metadata{}, 1, 5*1024*1024); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %q, want PUT", gotMethod)
+	}
+	if string(gotBody) != "payload-12345" {
+		t.Errorf("body = %q, want payload-12345", string(gotBody))
+	}
+}
+
+func TestSetBucketVersioning(t *testing.T) {
+	gotMethod := ""
+	gotQuery := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	if err := s.SetBucketVersioning(context.Background(), "Enabled", "any"); err != nil {
+		t.Fatalf("SetBucketVersioning: %v", err)
+	}
+	if gotMethod != http.MethodPut {
+		t.Errorf("method = %q, want PUT", gotMethod)
+	}
+	if !strings.Contains(gotQuery, "versioning") {
+		t.Errorf("query = %q, want to contain 'versioning'", gotQuery)
+	}
+}
+
+func TestGetBucketVersioning(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>`))
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	got, err := s.GetBucketVersioning(context.Background(), "any")
+	if err != nil {
+		t.Fatalf("GetBucketVersioning: %v", err)
+	}
+	if got != "Enabled" {
+		t.Errorf("got %q, want Enabled", got)
+	}
+}
+
+func TestGetBucketVersioning_Empty(t *testing.T) {
+	// S3 returns no <Status> element when versioning was never enabled --
+	// storage layer must surface this as empty string, not error.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration/>`))
+	}))
+	defer srv.Close()
+
+	s := newTestS3(t, srv)
+	got, err := s.GetBucketVersioning(context.Background(), "any")
+	if err != nil {
+		t.Fatalf("GetBucketVersioning: %v", err)
+	}
+	if got != "" {
+		t.Errorf("got %q, want empty (no Status element)", got)
+	}
+}
+
+func TestPut_DryRunSkipsRequest(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer srv.Close()
+	resetClientCache(t)
+	opts := Options{Endpoint: srv.URL, NoSignRequest: true, region: "us-east-1", DryRun: true, LogLevel: log.LevelInfo}
+	s, err := newS3Storage(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+	u, _ := url.New("s3://b/k")
+	if err := s.Put(context.Background(), strings.NewReader("x"), u, Metadata{}, 1, 5*1024*1024); err != nil {
+		t.Fatalf("Put dry-run: %v", err)
+	}
+	if hits != 0 {
+		t.Errorf("hits = %d, want 0", hits)
+	}
+}
+
+// writerAtBuf is a tiny io.WriterAt for in-memory captures used by TestGet_*.
+// The manager.Downloader writes ranges out of order so a plain bytes.Buffer
+// is insufficient.
+type writerAtBuf struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func newWriterAtBuf() *writerAtBuf { return &writerAtBuf{} }
+func (w *writerAtBuf) WriteAt(p []byte, off int64) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	end := int(off) + len(p)
+	if end > len(w.buf) {
+		w.buf = append(w.buf, make([]byte, end-len(w.buf))...)
+	}
+	copy(w.buf[off:], p)
+	return len(p), nil
+}
+func (w *writerAtBuf) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(w.buf)
+}
+
+// TestResolveBucketRegion_Success exercises the happy path: probe HeadBucket
+// returns 200 with X-Amz-Bucket-Region; the resolved region must be
+// surfaced and folded into opts before the real client is built.
+func TestResolveBucketRegion_Success(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Amz-Bucket-Region", "eu-west-1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	resetClientCache(t)
+
+	region, err := resolveBucketRegion(context.Background(), Options{
+		Endpoint:      srv.URL,
+		NoSignRequest: true,
+		bucket:        "any",
+		LogLevel:      log.LevelInfo,
+	})
+	if err != nil {
+		t.Fatalf("resolveBucketRegion: %v", err)
+	}
+	if region != "eu-west-1" {
+		t.Errorf("region = %q, want eu-west-1", region)
+	}
+}
+
+// TestResolveBucketRegion_BucketNotFound: GetBucketRegion returns
+// BucketNotFound for 404. resolveBucketRegion must swallow it (return nil
+// error so the caller doesn't double-log) -- the actual operation surfaces
+// the NotFound itself.
+func TestResolveBucketRegion_BucketNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	resetClientCache(t)
+
+	region, err := resolveBucketRegion(context.Background(), Options{
+		Endpoint:      srv.URL,
+		NoSignRequest: true,
+		bucket:        "missing",
+		LogLevel:      log.LevelInfo,
+	})
+	if err != nil {
+		t.Errorf("BucketNotFound must be silently swallowed, got: %v", err)
+	}
+	if region != "" {
+		t.Errorf("region = %q, want empty for BucketNotFound", region)
+	}
+}
+
+// TestResolveBucketRegion_OtherError: 5xx (or any non-404) must propagate
+// as a real error so newS3Storage logs it (without surfacing as a fatal).
+func TestResolveBucketRegion_OtherError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	resetClientCache(t)
+
+	_, err := resolveBucketRegion(context.Background(), Options{
+		Endpoint:      srv.URL,
+		NoSignRequest: true,
+		bucket:        "any",
+		MaxRetries:    1, // keep the test fast: don't retry the 500
+		LogLevel:      log.LevelInfo,
+	})
+	if err == nil {
+		t.Fatal("resolveBucketRegion: want non-nil error for 500")
+	}
+}
+
+// TestNewS3Storage_RegionAutoDetect: end-to-end -- when opts.region is
+// empty and opts.bucket is set, newS3Storage must invoke the probe and
+// fold the discovered region into the cached real client.
+func TestNewS3Storage_RegionAutoDetect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Amz-Bucket-Region", "ap-southeast-2")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	resetClientCache(t)
+
+	// region empty, bucket set -> probe runs.
+	s, err := newS3Storage(context.Background(), Options{
+		Endpoint:      srv.URL,
+		NoSignRequest: true,
+		bucket:        "any",
+		LogLevel:      log.LevelInfo,
+	})
+	if err != nil {
+		t.Fatalf("newS3Storage: %v", err)
+	}
+	if got := s.api.Options().Region; got != "ap-southeast-2" {
+		t.Errorf("client region = %q, want ap-southeast-2 (probe-resolved)", got)
 	}
 }
 

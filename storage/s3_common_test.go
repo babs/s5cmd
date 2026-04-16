@@ -7,6 +7,8 @@ import (
 	urlpkg "net/url"
 	"strings"
 	"testing"
+
+	"github.com/aws/smithy-go"
 )
 
 func TestParseEndpoint(t *testing.T) {
@@ -124,6 +126,38 @@ func TestIsCancelationError(t *testing.T) {
 		{"wrapped Canceled", &wrappedErr{ctx: context.Canceled}, true},
 		{"wrapped DeadlineExceeded", &wrappedErr{ctx: context.DeadlineExceeded}, true},
 		{"unrelated wrapped", &wrappedErr{ctx: errors.New("other")}, false},
+		// Realistic SDK shape: v2 returns an OperationError whose
+		// Unwrap() chain ends at context.Canceled when the caller
+		// cancels mid-flight. errors.Is must traverse the OperationError
+		// to find the cancellation; if it ever stops doing so (smithy
+		// changes the wrapping), this test fails immediately.
+		{
+			"smithy OperationError wrapping Canceled",
+			&smithy.OperationError{
+				ServiceID:     "S3",
+				OperationName: "GetObject",
+				Err:           context.Canceled,
+			},
+			true,
+		},
+		{
+			"smithy OperationError wrapping DeadlineExceeded",
+			&smithy.OperationError{
+				ServiceID:     "S3",
+				OperationName: "GetObject",
+				Err:           context.DeadlineExceeded,
+			},
+			true,
+		},
+		{
+			"smithy OperationError wrapping unrelated",
+			&smithy.OperationError{
+				ServiceID:     "S3",
+				OperationName: "GetObject",
+				Err:           errors.New("network: connection reset"),
+			},
+			false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

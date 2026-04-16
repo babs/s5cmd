@@ -136,11 +136,12 @@ func (e *cleanedAPIErr) Error() string {
 	return e.wrapped.ErrorCode() + ": " + msg
 }
 
+// Unwrap returns the wrapped smithy.APIError unchanged so errors.As /
+// errors.Is traversals reach the typed underlying error. smithy.APIError
+// always satisfies the error interface (it embeds Error() string), so the
+// type assertion in earlier code was dead -- removed.
 func (e *cleanedAPIErr) Unwrap() error {
-	if w, ok := e.wrapped.(error); ok {
-		return w
-	}
-	return nil
+	return e.wrapped.(error)
 }
 
 // cleanV2Err unwraps verbose smithy OperationError chains down to the inner
@@ -266,7 +267,10 @@ func (s *S3) HeadObject(ctx context.Context, u *url.URL) (*Object, *Metadata, er
 
 	// v2 returns nil when no user metadata is present; v1 returned an empty
 	// map. Preserve the empty-map shape so JSON callers see "metadata":{}
-	// instead of "metadata":null.
+	// instead of "metadata":null. Key case is left as-is: v2 SDK lowercases
+	// keys during deserialization (deserializers.go ToLower), and v1 SDK
+	// did the same -- e2e regexes already expect lowercase, so there's no
+	// case translation to do.
 	userMeta := output.Metadata
 	if userMeta == nil {
 		userMeta = map[string]string{}
