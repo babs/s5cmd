@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/scanner"
 	"go/token"
@@ -64,7 +65,7 @@ type Package struct {
 // syntax trees.
 //
 // The provided config can set any setting with the exception of Mode.
-func Graph(c *cache.Cache, cfg *packages.Config, patterns ...string) ([]*PackageSpec, error) {
+func Graph(cfg *packages.Config, patterns ...string) ([]*PackageSpec, error) {
 	var dcfg packages.Config
 	if cfg != nil {
 		dcfg = *cfg
@@ -109,7 +110,7 @@ func Graph(c *cache.Cache, cfg *packages.Config, patterns ...string) ([]*Package
 		} else {
 			spec.Config = config.DefaultConfig
 		}
-		spec.Hash, err = computeHash(c, spec)
+		spec.Hash, err = computeHash(spec)
 		if err != nil {
 			spec.Errors = append(spec.Errors, convertError(err)...)
 		}
@@ -137,11 +138,20 @@ func Graph(c *cache.Cache, cfg *packages.Config, patterns ...string) ([]*Package
 type program struct {
 	fset     *token.FileSet
 	packages map[string]*types.Package
+	options  *Options
 }
 
 type Stats struct {
 	Source time.Duration
 	Export map[*PackageSpec]time.Duration
+}
+
+type Options struct {
+	// The Go language version to use for the type checker. If unset, or if set
+	// to "module", it will default to the Go version specified in the module;
+	// if there is no module, it will default to the version of Go the
+	// executable was built with.
+	GoVersion string
 }
 
 // Load loads the package described in spec. Imports will be loaded
@@ -151,10 +161,17 @@ type Stats struct {
 // An error will only be returned for system failures, such as failure
 // to read export data from disk. Syntax and type errors, among
 // others, will only populate the returned package's Errors field.
-func Load(spec *PackageSpec) (*Package, Stats, error) {
+func Load(spec *PackageSpec, opts *Options) (*Package, Stats, error) {
+	if opts == nil {
+		opts = &Options{}
+	}
+	if opts.GoVersion == "" {
+		opts.GoVersion = "module"
+	}
 	prog := &program{
 		fset:     token.NewFileSet(),
 		packages: map[string]*types.Package{},
+		options:  opts,
 	}
 
 	stats := Stats{
@@ -192,6 +209,8 @@ func (prog *program) loadFromExport(spec *PackageSpec) (*Package, error) {
 	}
 	defer f.Close()
 
+	//lint:ignore SA1019 NewReader does exactly what we need: it supports Go
+	//  1.27 compiler export data and Go 1.28 cmd/export data.
 	r, err := gcexportdata.NewReader(f)
 	if err != nil {
 		return nil, err
@@ -224,13 +243,14 @@ func (prog *program) loadFromSource(spec *PackageSpec) (*Package, error) {
 		Syntax:      make([]*ast.File, len(spec.CompiledGoFiles)),
 		Fset:        prog.fset,
 		TypesInfo: &types.Info{
-			Types:      make(map[ast.Expr]types.TypeAndValue),
-			Defs:       make(map[*ast.Ident]types.Object),
-			Uses:       make(map[*ast.Ident]types.Object),
-			Implicits:  make(map[ast.Node]types.Object),
-			Scopes:     make(map[ast.Node]*types.Scope),
-			Selections: make(map[*ast.SelectorExpr]*types.Selection),
-			Instances:  map[*ast.Ident]types.Instance{},
+			Types:        make(map[ast.Expr]types.TypeAndValue),
+			Defs:         make(map[*ast.Ident]types.Object),
+			Uses:         make(map[*ast.Ident]types.Object),
+			Implicits:    make(map[ast.Node]types.Object),
+			Scopes:       make(map[ast.Node]*types.Scope),
+			Selections:   make(map[*ast.SelectorExpr]*types.Selection),
+			Instances:    make(map[*ast.Ident]types.Instance),
+			FileVersions: make(map[*ast.File]string),
 		},
 	}
 	// runtime.SetFinalizer(pkg, func(pkg *Package) {
@@ -288,11 +308,22 @@ func (prog *program) loadFromSource(spec *PackageSpec) (*Package, error) {
 			pkg.Errors = append(pkg.Errors, convertError(err)...)
 		},
 	}
-	if spec.Module != nil && spec.Module.GoVersion != "" {
-		tc.GoVersion = "go" + spec.Module.GoVersion
+	if prog.options.GoVersion == "module" {
+		if spec.Module != nil && spec.Module.GoVersion != "" {
+			tc.GoVersion = "go" + spec.Module.GoVersion
+		} else {
+			tags := build.Default.ReleaseTags
+			tc.GoVersion = tags[len(tags)-1]
+		}
+	} else {
+		tc.GoVersion = prog.options.GoVersion
 	}
-	types.NewChecker(tc, pkg.Fset, pkg.Types, pkg.TypesInfo).Files(pkg.Syntax)
-	return pkg, nil
+	// Note that the type-checker can return a non-nil error even though the Go
+	// compiler has already successfully built this package (which is an
+	// invariant of getting to this point), for example because of the Go
+	// version passed to the type checker.
+	err := types.NewChecker(tc, pkg.Fset, pkg.Types, pkg.TypesInfo).Files(pkg.Syntax)
+	return pkg, err
 }
 
 func convertError(err error) []packages.Error {
@@ -331,7 +362,7 @@ func convertError(err error) []packages.Error {
 
 	case config.ParseError:
 		errs = append(errs, packages.Error{
-			Pos:  fmt.Sprintf("%s:%d", err.Filename, err.Position.Line),
+			Pos:  fmt.Sprintf("%s:%d:%d", err.Filename, err.Position.Line, err.Position.Col),
 			Msg:  fmt.Sprintf("%s (last key parsed: %q)", err.Message, err.LastKey),
 			Kind: packages.ParseError,
 		})
