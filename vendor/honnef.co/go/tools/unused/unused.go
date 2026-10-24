@@ -8,6 +8,7 @@ import (
 	"go/types"
 	"io"
 	"reflect"
+	"slices"
 	"strings"
 
 	"honnef.co/go/tools/analysis/facts/directives"
@@ -94,6 +95,7 @@ This overview is true when using the default options. Different options may chan
   - (6.3) embedded fields that help implement interfaces (either fully implements it, or contributes required methods) (recursively)
   - (6.4) embedded fields that have exported methods (recursively)
   - (6.5) embedded structs that have exported fields (recursively)
+  - (6.6) all fields if they have a structs.HostLayout field
 
 - (7.1) field accesses use fields
 - (7.2) fields use their types
@@ -168,7 +170,7 @@ type Result struct {
 }
 
 var Analyzer = &lint.Analyzer{
-	Doc: &lint.Documentation{
+	Doc: &lint.RawDocumentation{
 		Title: "Unused code",
 	},
 	Analyzer: &analysis.Analyzer{
@@ -176,7 +178,7 @@ var Analyzer = &lint.Analyzer{
 		Doc:        "Unused code",
 		Run:        run,
 		Requires:   []*analysis.Analyzer{generated.Analyzer, directives.Analyzer},
-		ResultType: reflect.TypeOf(Result{}),
+		ResultType: reflect.TypeFor[Result](),
 	},
 }
 
@@ -205,7 +207,7 @@ func newGraph(
 	return &g
 }
 
-func run(pass *analysis.Pass) (interface{}, error) {
+func run(pass *analysis.Pass) (any, error) {
 	g := newGraph(
 		pass.Fset,
 		pass.Files,
@@ -344,7 +346,7 @@ func (g *graph) objectToObject(obj types.Object) Object {
 	}
 	name := obj.Name()
 	if sig, ok := obj.Type().(*types.Signature); ok && sig.Recv() != nil {
-		switch sig.Recv().Type().(type) {
+		switch types.Unalias(sig.Recv().Type()).(type) {
 		case *types.Named, *types.Pointer:
 			typ := types.TypeString(sig.Recv().Type(), func(*types.Package) string { return "" })
 			if len(typ) > 0 && typ[0] == '*' {
@@ -534,10 +536,22 @@ func (g *graph) entry() {
 		}
 	}
 
+	// We use a normal map instead of a typeutil.Map because we deduplicate
+	// these on a best effort basis, as an optimization.
+	allInterfaces := make(map[*types.Interface]struct{})
+	for _, typ := range g.interfaceTypes {
+		allInterfaces[typ] = struct{}{}
+	}
+	for _, ins := range g.info.Instances {
+		if typ, ok := ins.Type.(*types.Named); ok && typ.Obj().Pkg() == g.pkg {
+			if iface, ok := typ.Underlying().(*types.Interface); ok {
+				allInterfaces[iface] = struct{}{}
+			}
+		}
+	}
 	processMethodSet := func(named *types.TypeName, ms *types.MethodSet) {
 		if g.opts.ExportedIsUsed {
-			for i := 0; i < ms.Len(); i++ {
-				m := ms.At(i)
+			for m := range ms.Methods() {
 				if token.IsExported(m.Obj().Name()) {
 					// (2.1) named types use exported methods
 					// (6.4) structs use embedded fields that have exported methods
@@ -552,7 +566,7 @@ func (g *graph) entry() {
 			// (8.0) handle interfaces
 			//
 			// We don't care about interfaces implementing interfaces; all their methods are already used, anyway
-			for _, iface := range g.interfaceTypes {
+			for iface := range allInterfaces {
 				if sels, ok := implements(named.Type(), iface, ms); ok {
 					for _, sel := range sels {
 						// (8.2) any concrete type implements all known interfaces
@@ -583,26 +597,23 @@ func (g *graph) entry() {
 		if len(dir.Arguments) == 0 {
 			continue
 		}
-		for _, check := range strings.Split(dir.Arguments[0], ",") {
-			if check == "U1000" {
-				pos := g.fset.PositionFor(dir.Node.Pos(), false)
-				var key ignoredKey
-				switch dir.Command {
-				case "ignore":
-					key = ignoredKey{
-						pos.Filename,
-						pos.Line,
-					}
-				case "file-ignore":
-					key = ignoredKey{
-						pos.Filename,
-						-1,
-					}
+		if slices.Contains(strings.Split(dir.Arguments[0], ","), "U1000") {
+			pos := g.fset.PositionFor(dir.Node.Pos(), false)
+			var key ignoredKey
+			switch dir.Command {
+			case "ignore":
+				key = ignoredKey{
+					pos.Filename,
+					pos.Line,
 				}
-
-				ignores[key] = struct{}{}
-				break
+			case "file-ignore":
+				key = ignoredKey{
+					pos.Filename,
+					-1,
+				}
 			}
+
+			ignores[key] = struct{}{}
 		}
 	}
 
@@ -628,7 +639,7 @@ func (g *graph) entry() {
 				// use methods and fields of ignored types
 				if obj, ok := obj.(*types.TypeName); ok {
 					if obj.IsAlias() {
-						if typ, ok := obj.Type().(*types.Named); ok && (g.opts.ExportedIsUsed && typ.Obj().Pkg() != obj.Pkg() || typ.Obj().Pkg() == nil) {
+						if typ, ok := types.Unalias(obj.Type()).(*types.Named); ok && (g.opts.ExportedIsUsed && typ.Obj().Pkg() != obj.Pkg() || typ.Obj().Pkg() == nil) {
 							// This is an alias of a named type in another package.
 							// Don't walk its fields or methods; we don't have to.
 							//
@@ -637,14 +648,14 @@ func (g *graph) entry() {
 							continue
 						}
 					}
-					if typ, ok := obj.Type().(*types.Named); ok {
-						for i := 0; i < typ.NumMethods(); i++ {
-							g.use(typ.Method(i), nil)
+					if typ, ok := types.Unalias(obj.Type()).(*types.Named); ok {
+						for method := range typ.Methods() {
+							g.use(method, nil)
 						}
 					}
 					if typ, ok := obj.Type().Underlying().(*types.Struct); ok {
-						for i := 0; i < typ.NumFields(); i++ {
-							g.use(typ.Field(i), nil)
+						for field := range typ.Fields() {
+							g.use(field, nil)
 						}
 					}
 				}
@@ -722,8 +733,8 @@ func (g *graph) read(node ast.Node, by types.Object) {
 			if g.opts.FieldWritesAreUses && unkeyed {
 				// Untagged struct literal that specifies all fields. We have to manually use the fields in the type,
 				// because the unkeyd literal doesn't contain any nodes referring to the fields.
-				for i := 0; i < typ.NumFields(); i++ {
-					g.use(typ.Field(i), by)
+				for field := range typ.Fields() {
+					g.use(field, by)
 				}
 			}
 			if g.opts.FieldWritesAreUses || unkeyed {
@@ -735,6 +746,20 @@ func (g *graph) read(node ast.Node, by types.Object) {
 					kv := elt.(*ast.KeyValueExpr)
 					g.write(kv.Key, by)
 					g.read(kv.Value, by)
+				}
+			}
+			if g.opts.FieldWritesAreUses && !unkeyed {
+				for _, elt := range node.Elts {
+					kv := elt.(*ast.KeyValueExpr)
+					fname := kv.Key.(*ast.Ident).Name
+					_, index, _ := types.LookupFieldOrMethod(typ, true, g.pkg, fname)
+
+					cur := typ
+					for _, step := range index[:len(index)-1] {
+						field := cur.Field(step)
+						g.use(field, by)
+						cur = typeutil.CoreType(field.Type()).(*types.Struct)
+					}
 				}
 			}
 		} else {
@@ -874,7 +899,7 @@ func (g *graph) read(node ast.Node, by types.Object) {
 			g.read(arg, by)
 		}
 
-		// Handle conversiosn
+		// Handle conversions
 		conv := node
 		if len(conv.Args) != 1 || conv.Ellipsis.IsValid() {
 			return
@@ -920,8 +945,7 @@ func (g *graph) read(node ast.Node, by types.Object) {
 func (g *graph) useAllFieldsRecursively(typ types.Type, by types.Object) {
 	switch typ := typ.Underlying().(type) {
 	case *types.Struct:
-		for i := 0; i < typ.NumFields(); i++ {
-			field := typ.Field(i)
+		for field := range typ.Fields() {
 			g.use(field, by)
 			g.useAllFieldsRecursively(field.Type(), by)
 		}
@@ -960,7 +984,7 @@ func (g *graph) write(node ast.Node, by types.Object) {
 
 	case *ast.SelectorExpr:
 		if g.opts.FieldWritesAreUses {
-			// Writing to a field constitutes a use. See https://staticcheck.io/issues/288 for some discussion on that.
+			// Writing to a field constitutes a use. See https://staticcheck.dev/issues/288 for some discussion on that.
 			//
 			// This code can also get triggered by qualified package variables, in which case it doesn't matter what we do,
 			// because the object is in another package.
@@ -1330,7 +1354,7 @@ func (g *graph) stmt(stmt ast.Stmt, by types.Object) {
 				g.read(comm.Chan, by)
 				g.read(comm.Value, by)
 			case *ast.ExprStmt:
-				g.read(astutil.Unparen(comm.X).(*ast.UnaryExpr).X, by)
+				g.read(ast.Unparen(comm.X).(*ast.UnaryExpr).X, by)
 			case *ast.AssignStmt:
 				for _, lhs := range comm.Lhs {
 					g.write(lhs, by)
@@ -1457,13 +1481,13 @@ func isNoCopyType(typ types.Type) bool {
 		return false
 	}
 
-	named, ok := typ.(*types.Named)
+	named, ok := types.Unalias(typ).(*types.Named)
 	if !ok {
 		return false
 	}
 	switch num := named.NumMethods(); num {
 	case 1, 2:
-		for i := 0; i < num; i++ {
+		for i := range num {
 			meth := named.Method(i)
 			if meth.Name() != "Lock" && meth.Name() != "Unlock" {
 				return false
@@ -1483,8 +1507,11 @@ func (g *graph) namedType(typ *types.TypeName, spec ast.Expr) {
 	// (2.2) named types use the type they're based on
 
 	if st, ok := spec.(*ast.StructType); ok {
-		// Named structs are special in that its unexported fields are only used if they're being written to. That is,
-		// the fields are not used by the named type itself, nor are the types of the fields.
+		var hasHostLayout bool
+
+		// Named structs are special in that their unexported fields are only
+		// used if they're being written to. That is, the fields are not used by
+		// the named type itself, nor are the types of the fields.
 		for _, field := range st.Fields.List {
 			seen := map[*types.Struct]struct{}{}
 			// For `type x struct { *x; F int }`, don't visit the embedded x
@@ -1499,8 +1526,7 @@ func (g *graph) namedType(typ *types.TypeName, spec ast.Expr) {
 					return false
 				}
 				seen[t] = struct{}{}
-				for i := 0; i < t.NumFields(); i++ {
-					field := t.Field(i)
+				for field := range t.Fields() {
 					if field.Exported() {
 						return true
 					}
@@ -1545,6 +1571,40 @@ func (g *graph) namedType(typ *types.TypeName, spec ast.Expr) {
 				}
 			}
 
+			// (6.6) if the struct has a field of type structs.HostLayout, then
+			// this signals that all fields are relevant to match some
+			// externally specified memory layout.
+			//
+			// This augments the 5.2 heuristic of using all fields when
+			// converting via unsafe.Pointer. For example, 5.2 doesn't currently
+			// handle conversions involving more than one level of pointer
+			// indirection (although it probably should). Another example that
+			// doesn't involve the use of unsafe at all is exporting symbols for
+			// use by C libraries.
+			//
+			// The actual requirements for the use of structs.HostLayout fields
+			// haven't been determined yet. It's an open question whether named
+			// types of underlying type structs.HostLayout, aliases of it,
+			// generic instantiations, or embedding structs that themselves
+			// contain a HostLayout field count as valid uses of the marker (see
+			// https://golang.org/issues/66408#issuecomment-2120644459)
+			//
+			// For now, we require a struct to have a field of type
+			// structs.HostLayout or an alias of it, where the field itself may
+			// be embedded. We don't handle fields whose types are type
+			// parameters.
+			fieldType := types.Unalias(g.info.TypeOf(field.Type))
+			if fieldType, ok := fieldType.(*types.Named); ok {
+				obj := fieldType.Obj()
+				if obj.Name() == "HostLayout" && obj.Pkg().Path() == "structs" {
+					hasHostLayout = true
+				}
+			}
+		}
+
+		// For 6.6.
+		if hasHostLayout {
+			g.useAllFieldsRecursively(typ.Type(), typ)
 		}
 	} else {
 		g.read(spec, typ)
